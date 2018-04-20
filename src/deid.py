@@ -38,14 +38,21 @@ class Policy :
         elif 'path' in args :
             self.client = bq.Client.from_service_account_json(args['path'])
 
-        
-        
     def can_do(self,id,meta):
         """
-            This function determines if this policy can be applied to a table (specified by the meta data)
-            @param meta     meta data of the table
+            This function will determine if a table has fields that are candidate for suppression
+            
+            @param id       table identifier
+            @param meta     list of SchemaField objects
         """
-        return False
+        if id not in self.cache :
+            if id in self.policies and id not in self.cache:
+                info = self.policies[id]
+                self.cache[id] = sum([ int(field.name in info) for field in meta ]) > 0
+            else:
+                self.cache[id] = False
+        return self.cache[id]
+    
     def do(self,**args) :
         return None
     
@@ -71,20 +78,20 @@ class Suppress(Policy):
         """
         self.meta = args['meta'] 
         
-    def can_do(self,id,meta):
-        """
-            This function will determine if a table has fields that are candidate for suppression
+    #def can_do(self,id,meta):
+        #"""
+            #This function will determine if a table has fields that are candidate for suppression
             
-            @param id       table identifier
-            @param meta     list of SchemaField objects
-        """
-        if id not in self.cache :
-            if id in self.policies and id not in self.cache:
-                info = self.policies[id]
-                self.cache[id] = sum([ int(field.name in info) for field in meta ]) > 0
-            else:
-                self.cache[id] = False
-        return self.cache[id]
+            #@param id       table identifier
+            #@param meta     list of SchemaField objects
+        #"""
+        #if id not in self.cache :
+            #if id in self.policies and id not in self.cache:
+                #info = self.policies[id]
+                #self.cache[id] = sum([ int(field.name in info) for field in meta ]) > 0
+            #else:
+                #self.cache[id] = False
+        #return self.cache[id]
     def get(self,id,info):
         """
             This function will return a row after suppressing fields that need to be suppressed
@@ -133,12 +140,28 @@ class Transform(Policy):
         pass
 
 class Shift(Transform):
+    
     """
         This class is designed to determine how dates will be shifted. 
         i.e A value will be returned as follows {name:<name>,value:<value>} (this is a transformation)
     """
     def __init__(self,**args):
+        
         pass
+    def do(self,**args):
+        """
+        """
+        table_name = ".".join([args['dataset'],args['table_name']])
+        fields = self.cache[table_name]
+        field_values = []
+        OFFSET_TERM = "DATETIME_ADD(:field, INTERVAL :offset DAYS)"
+        for field in fields :
+            value = field+" = "+OFFSET_TERM.replace(":field",field).replace(":offset",self.offset)
+        sql = """
+            UPDATE :table_name
+            set :field_values
+        """.replace(":table_name",table_name).replace(":field_values",field_values)
+        
     
 class BQHandler:
 	"""
