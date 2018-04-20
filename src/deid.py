@@ -11,11 +11,135 @@
     
     
 """
-
+from __future__ import division
 import json
 from google.cloud import bigquery as bq
-from google.cloud import storage
 
+class Policy :
+    """
+        This function will apply Policies given the fields found on a given table
+        The policy hierarchy will be applied as an iterator design pattern.
+    """
+    @staticmethod
+    def instance(meta):
+        """
+            This function will return one or severeal instances of a policies associated with the meta data
+        """
+        return None
+    
+    def __init__(self,**args):
+        """
+            This function loads basic specifications for a policy
+        """
+        self.fields = []
+        self.policies = {}
+        if 'client' in args :
+            self.client = args['client']
+        elif 'path' in args :
+            self.client = bq.Client.from_service_account_json(args['path'])
+
+        
+        
+    def can_do(self,id,meta):
+        """
+            This function determines if this policy can be applied to a table (specified by the meta data)
+            @param meta     meta data of the table
+        """
+        return False
+    def do(self,**args) :
+        return None
+    
+class Suppress(Policy):
+    """
+        This class implements supression rules on a table (specified by meta data)
+        
+    """
+    def __init__(self,**args):
+        """
+            @param policy     contains table with list of fields to be suppressed
+        """
+        Policy.__init__(self,**args)
+        self.policies = args['policy']['suppression'] if 'suppression' in args['policy'] else {}
+        self.cache = {}
+        
+    def init(self,**args):
+        """
+            This function is a live Initialization function i.e it will set the meta data of a table
+            The meta data is of type SchemaField (google bigquery API reference)
+            
+            @param meta meta data list of SchemaField objects
+        """
+        self.meta = args['meta'] 
+        
+    def can_do(self,id,meta):
+        """
+            This function will determine if a table has fields that are candidate for suppression
+            
+            @param id       table identifier
+            @param meta     list of SchemaField objects
+        """
+        if id not in self.cache :
+            if id in self.policies and id not in self.cache:
+                info = self.policies[id]
+                self.cache[id] = sum([ int(field.name in info) for field in meta ]) > 0
+            else:
+                self.cache[id] = False
+        return self.cache[id]
+    def get(self,id,info):
+        """
+            This function will return a row after suppressing fields that need to be suppressed
+            @param id       table identifier
+            @param info     meta data (information for a given table)
+        """
+        if id in self.cache :
+            ref = self.policies[id]
+            return [field for field in info if field.name not in ref]
+        return None
+    def do(self,**args):
+        """
+            This function will create a new table in a designated area. The function requires can_do function to be run before:
+            This will set the cache with the appropriate information
+            @pre:       self.can_do(table_name,meta) == True
+            
+            
+            @param i_dataset   input/source dataset
+            @param table_name     input/source table
+            @param o_dataset    target dataset identifier
+        """
+        i_dataset       = args['i_dataset']
+        table_name      = args['table_name']
+        o_dataset       = args['o_dataset']
+        
+        job     = bq.QueryJobConfig()
+        ref     = self.client.dataset(i_dataset).table(table_name)
+        meta    = self.client.get_table(ref).schema
+        fields  = self.get(table_name,meta)
+        # 
+        # setting up the destination
+        otable = self.client.dataset(o_dataset).table(table_name)
+        job.destination = otable
+        fields = ",".join([field.name for field in fields])
+        sql = """
+                SELECT :fields
+                FROM :table
+        """.replace(":table",i_dataset+"."+table_name).replace(":fields",fields)
+        self.client.query(
+                sql,
+                location='US',job_config=job)
+        pass
+
+class Transform(Policy):
+    def __init__(self,**args):
+        pass
+
+class Shift(Transform):
+    """
+        This class is designed to determine how dates will be shifted. 
+        i.e A value will be returned as follows {name:<name>,value:<value>} (this is a transformation)
+    """
+    def __init__(self,**args):
+        pass
+    
 class BQHandler:
 	"""
 		This is a Big Query handler that is intended to serve as an interface to bq
@@ -61,7 +185,9 @@ class BQHandler:
                 @param dataset_name     name of the dataset
                 @param table_name       name of the table
             """
-            table = [table for table in self.get_tables(dataset_name) if table.table_id == table_name ]
+            ltables = self.get_tables(dataset_name)
+            print " ** ", len(ltables)
+            table = [table for table in ltables if table.table_id == table_name ]
             if table :
                 table = table[0]
                 table = self.client.get_table(table.reference)
@@ -77,6 +203,5 @@ class Deid:
 	def __init__(self):
 		pass
             
-handler = BQHandler('config/account/account.json')
-handler.init()
-handler.meta('raw','concept')
+#handler = BQHandler('config/account/account.json')
+#handler.meta('raw','concept')
