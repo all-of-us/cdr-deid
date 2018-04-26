@@ -3,12 +3,12 @@
     Steve L. Nyemba<steve.l.nyemba@vanderbilt.edu>
     
     This file implements the deidentification policy for the All of Us project. This is a rule based approach:
-    Policies are the application of operations on a record :
-        - The operations can be applied on data-types
-        - The operations can be applied on tables (suppression of fields)
-    
-    @TODO:
-    
+        - Suppression of PPI, EHR, PM
+        - Date Shifting
+        - Generalization of certain fields (Zip, ICD9)
+        
+    It should be noted that the DRC database is hybrid rational & meta-database of sort (not sure why hybrid)
+    The database will contain meta information about the data and the data as well (in most cases).
     
 """
 from __future__ import division
@@ -21,7 +21,7 @@ class Policy :
         The policy hierarchy will be applied as an iterator design pattern.
     """
     @staticmethod
-    def instance(meta):
+    def instance(**args):
         """
             This function will return one or severeal instances of a policies associated with the meta data
         """
@@ -55,8 +55,116 @@ class Policy :
     
     def do(self,**args) :
         return None
-    
+
 class Suppress(Policy):
+    """
+        This class is intended to abstract the operations associated with suppression i.e :
+        - PPI   This can be fully performed within the database
+        - EHR   This operation is performed given a list of fields and applies to a relational table.
+        - PM    
+        
+    """
+    def __init__(self,**args):
+            Policy.__init__(self,**args)
+            self.cache = {}
+class SuppressPPI(Suppress):            
+    """
+        This function will perform suppression of PPI 
+        DESIGN:
+            - Retrieve the appropriate concepts given the vocabulary_id = 'PPI' 
+            and insure that this applies to concept_class_id in ('Questions', 'PPI Modifier')
+            
+            @param <path|client>    provide an initialized client object or the path of a json service account
+    """
+    def __init__(self,**args):
+        """
+            @param vocabulary_id    vocabulary identifier by default 'PPI'
+            @param concept_class_id concept_class_id by default ('Question','PPI Modifier')
+
+        """
+            
+        Suppress.__init__(self,**args);
+        self.vocabulary_id = args['vocabulary_id'] if 'vocabulary_id' in args else 'PPI'
+        self.concept_class_id = args['concept_class_id'] if 'concept_class_id' in args else ['Question','PPI Modifier']
+        if isinstance(self.concept_class_id,str):
+            self.concept_class_id = self.concept_class_id.split(",")
+    def init(self,id):
+        pass
+    def can_do(self,id,meta=None):
+        """
+            This function determines if it can perform a suppression of PPI 
+            @param id   vocabulary_id
+            
+        """
+        if self.vocabulary_id not in self.cache :
+            sql = """
+                SELECT concept_code from :dataset.concept
+                WHERE vocabulary_id = ':vocabulary_id'
+
+            """.replace(":dataset",id).replace(":vocabulary_id",self.vocabulary_id)
+            if self.concept_class_id is not None or len(self.concept_class_id) > 0 :
+                #
+                # In case we have concept_class_id specified we need to add a condition to the filter
+                #
+                sql = sql + " and concept_class_id in ('"+"','".join(self.concept_class_id)+"')"
+            sql = sql +" GROUP BY concept_code"
+            #
+            # Execute the query to get a list of concepts that should be removed from a meta table
+            #
+            
+            job = self.client.query(sql,location='US')
+            if job.error_result is None :
+                self.policies[self.vocabulary_id] = list(job) 
+            #
+            # If no error is returned then it means we can perform this operation
+            #
+            self.cache[self.vocabulary_id] = job.error_result is None
+
+        return self.cache[self.vocabulary_id] if self.vocabulary_id in self.cache else False
+    
+    def get(self,id,field=None):
+        """
+            returns the fields for a given
+        """
+        if id in self.policies :
+            return self.policies[id]
+        return None
+    def do(self,**args):
+        """
+            This function performs supporession of PPI
+        """
+        i_dataset = args['i_dataset']
+        o_dataset = args['o_dataset']
+        table_name = args['table_name']
+        vocabulary_id = self.vocabulary_id
+        if self.can_do(i_dataset) : 
+            #
+            # @TODO: Log what is happening here
+            codes = self.get(self.vocabulary_id)
+            print [len(codes),'Concept Will be suprressed from ', i_dataset,'.',table_name, ' to ' , o_dataset]
+            codes = "'"+"','".join([item.concept_code for item in codes])+"'"
+            
+            sql = """
+                
+                SELECT *
+                FROM :i_dataset.:table_name 
+                WHERE observation_source_value not in (:concept_codes) and person_id = 562270
+            """.replace(":i_dataset",i_dataset).replace(":table_name",table_name)
+            sql = sql.replace(":concept_codes",codes)
+            #
+            # @TODO: Log what is happening here (setting up job)
+            job = bq.QueryJobConfig()
+            otable = self.client.dataset(o_dataset).table(table_name)
+            job.destination = otable
+            
+            #job = self.client.query(sql,location='US',job_config=job)
+            #
+            # @TODO Log job.error_result :
+            #   if None, then no error occurred
+            #   else    Log the error
+            
+
+class SupressEHR(Suppress):
     """
         This class implements supression rules on a table (specified by meta data)
         
@@ -130,7 +238,7 @@ class Suppress(Policy):
                 SELECT :fields
                 FROM :table
         """.replace(":table",i_dataset+"."+table_name).replace(":fields",fields)
-        self.client.query(
+        job = self.client.query(
                 sql,
                 location='US',job_config=job)
         pass
@@ -144,12 +252,19 @@ class Shift(Transform):
     """
         This class is designed to determine how dates will be shifted. 
         i.e A value will be returned as follows {name:<name>,value:<value>} (this is a transformation)
+        
+        @TODO:
+        The date shifting should be performed on the basis of a person's day of participation in the study
     """
     def __init__(self,**args):
         
         pass
     def do(self,**args):
         """
+            We initially perform the shift on the basis of an arbitrary date
+        """
+        sql_date = """
+            SELECT DATETIME_ADD(:field, INTERVAL :offsetd
         """
         table_name = ".".join([args['dataset'],args['table_name']])
         fields = self.cache[table_name]
