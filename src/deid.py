@@ -139,7 +139,7 @@ class SuppressPPI(Suppress):
         vocabulary_id = self.vocabulary_id
         if self.can_do(i_dataset) : 
             #
-            # @TODO: Log what is happening here
+            # @TODO: Log what is happening here and REMOVE THE PERSON_ID
             codes = self.get(self.vocabulary_id)
             print [len(codes),'Concept Will be suprressed from ', i_dataset,'.',table_name, ' to ' , o_dataset]
             codes = "'"+"','".join([item.concept_code for item in codes])+"'"
@@ -164,17 +164,22 @@ class SuppressPPI(Suppress):
             #   else    Log the error
             
 
-class SupressEHR(Suppress):
+class SuppressEHR(Suppress):
     """
         This class implements supression rules on a table (specified by meta data)
         
     """
     def __init__(self,**args):
         """
-            @param policy     contains table with list of fields to be suppressed
+            This function is initialize the suppression of an EHR tables. The assumption is that EHR tables are rational and we can remove the fields
+            @TODO: Make sure it is ok to remove the concepts instead of the table's physical attributes.
+            
+            @param supress      {schema_name:{table_o:[field_1,field_2],table_1:[]}}
+            @param client|path  path to service account json file or client object
         """
         Policy.__init__(self,**args)
-        self.policies = args['policy']['suppression'] if 'suppression' in args['policy'] else {}
+        
+        self.policies = args['config'] if 'config' in args else {}
         self.cache = {}
         
     def init(self,**args):
@@ -182,33 +187,39 @@ class SupressEHR(Suppress):
             This function is a live Initialization function i.e it will set the meta data of a table
             The meta data is of type SchemaField (google bigquery API reference)
             
-            @param meta meta data list of SchemaField objects
         """
-        self.meta = args['meta'] 
-        
-    #def can_do(self,id,meta):
-        #"""
-            #This function will determine if a table has fields that are candidate for suppression
-            
-            #@param id       table identifier
-            #@param meta     list of SchemaField objects
-        #"""
-        #if id not in self.cache :
-            #if id in self.policies and id not in self.cache:
-                #info = self.policies[id]
-                #self.cache[id] = sum([ int(field.name in info) for field in meta ]) > 0
-            #else:
-                #self.cache[id] = False
-        #return self.cache[id]
-    def get(self,id,info):
+        pass
+    def can_do(self,dataset,table):
         """
-            This function will return a row after suppressing fields that need to be suppressed
+            This function determines if the class can suppress a given table.
+            @param dataset  dataset identifier
+            @param  table   table identifier
+        """
+        if dataset not in self.cache :
+            self.cache[dataset] = {}
+        if table not in self.cache[dataset] :
+            ref = self.client.dataset(dataset).table(table)
+            try:
+                schema = self.client.get_table(ref).schema
+                if len(schema) > 0 :
+                    lfields = self.policies[dataset][table]
+                    self.cache[dataset][table] = [field.name for field in schema if field.name not in lfields]
+                
+            except Exception,e:
+                #
+                # @TODO:
+                # We need to log the error here
+                pass
+                
+        return len(self.cache[dataset][table])>0 if dataset in self.cache and table in self.cache[dataset] else False
+    def get(self,dataset, table):
+        """
+            This function will return a list of fields that need to be removed from a table
             @param id       table identifier
             @param info     meta data (information for a given table)
         """
-        if id in self.cache :
-            ref = self.policies[id]
-            return [field for field in info if field.name not in ref]
+        if dataset in self.cache and table in self.cache[dataset]:
+            return self.cache[dataset][table]
         return None
     def do(self,**args):
         """
@@ -226,14 +237,12 @@ class SupressEHR(Suppress):
         o_dataset       = args['o_dataset']
         
         job     = bq.QueryJobConfig()
-        ref     = self.client.dataset(i_dataset).table(table_name)
-        meta    = self.client.get_table(ref).schema
-        fields  = self.get(table_name,meta)
+        fields  = self.get(i_dataset,table_name)
         # 
         # setting up the destination
         otable = self.client.dataset(o_dataset).table(table_name)
         job.destination = otable
-        fields = ",".join([field.name for field in fields])
+        fields = ",".join(fields)
         sql = """
                 SELECT :fields
                 FROM :table
@@ -243,11 +252,7 @@ class SupressEHR(Suppress):
                 location='US',job_config=job)
         pass
 
-class Transform(Policy):
-    def __init__(self,**args):
-        pass
-
-class Shift(Transform):
+class Shift(SuppressEHR):
     
     """
         This class is designed to determine how dates will be shifted. 
