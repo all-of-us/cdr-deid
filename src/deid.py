@@ -88,31 +88,33 @@ class SuppressPPI(Suppress):
         self.concept_class_id = args['concept_class_id'] if 'concept_class_id' in args else ['Question','PPI Modifier']
         if isinstance(self.concept_class_id,str):
             self.concept_class_id = self.concept_class_id.split(",")
+        self.concept_sql = """
+                SELECT concept_code from :dataset.concept
+                WHERE vocabulary_id = ':vocabulary_id' AND REGEXP_CONTAINS(concept_code,'(Date|DATE|date)') is FALSE
+
+            """
     def init(self,id):
         pass
     def can_do(self,id,meta=None):
         """
-            This function determines if it can perform a suppression of PPI 
+            This function determines if it can perform a suppression of PPI. The PPI extracted shouldn't be dates because dates will be shifted.
             @param id   vocabulary_id
             
         """
         if self.vocabulary_id not in self.cache :
-            sql = """
-                SELECT concept_code from :dataset.concept
-                WHERE vocabulary_id = ':vocabulary_id'
-
-            """.replace(":dataset",id).replace(":vocabulary_id",self.vocabulary_id)
+            self.concept_sql = self.concept_sql.replace(":dataset",id).replace(":vocabulary_id",self.vocabulary_id)
+            
             if self.concept_class_id is not None or len(self.concept_class_id) > 0 :
                 #
                 # In case we have concept_class_id specified we need to add a condition to the filter
                 #
-                sql = sql + " and concept_class_id in ('"+"','".join(self.concept_class_id)+"')"
-            sql = sql +" GROUP BY concept_code"
+                self.concept_sql = self.concept_sql + " and concept_class_id in ('"+"','".join(self.concept_class_id)+"')"
+            self.concept_sql = self.concept_sql +" GROUP BY concept_code"
             #
             # Execute the query to get a list of concepts that should be removed from a meta table
             #
             
-            job = self.client.query(sql,location='US')
+            job = self.client.query(self.concept_sql,location='US')
             if job.error_result is None :
                 self.policies[self.vocabulary_id] = list(job) 
             #
@@ -157,7 +159,7 @@ class SuppressPPI(Suppress):
             otable = self.client.dataset(o_dataset).table(table_name)
             job.destination = otable
             
-            #job = self.client.query(sql,location='US',job_config=job)
+            job = self.client.query(sql,location='US',job_config=job)
             #
             # @TODO Log job.error_result :
             #   if None, then no error occurred
@@ -252,7 +254,7 @@ class SuppressEHR(Suppress):
                 location='US',job_config=job)
         pass
 
-class Shift(SuppressEHR):
+class Shift(SuppressPPI):
     
     """
         This class is designed to determine how dates will be shifted. 
@@ -262,27 +264,52 @@ class Shift(SuppressEHR):
         The date shifting should be performed on the basis of a person's day of participation in the study
     """
     def __init__(self,**args):
-        
+        SuppressPPI.__init__(self,**args)
+        self.concept_sql = """        
+            SELECT concept_code from :dataset.concept
+            WHERE vocabulary_id = ':vocabulary_id' AND REGEXP_CONTAINS(concept_code,'(Date|DATE|date)') is TRUE
+
+        """      
         pass
     def do(self,**args):
         """
-            We initially perform the shift on the basis of an arbitrary date
+            This function will 
         """
-        sql_date = """
-            SELECT DATETIME_ADD(:field, INTERVAL :offsetd
-        """
-        table_name = ".".join([args['dataset'],args['table_name']])
-        fields = self.cache[table_name]
-        field_values = []
-        OFFSET_TERM = "DATETIME_ADD(:field, INTERVAL :offset DAYS)"
-        for field in fields :
-            value = field+" = "+OFFSET_TERM.replace(":field",field).replace(":offset",self.offset)
+        i_dataset   = args['i_dataset']
+        o_dataset   = args['o_dataset']
+        table_name  = args['table_name']
+        print  " *** done "
+        table_ref   = self.client.dataset(o_dataset).table(table_name)
+        schema      = self.client.get_table(table_ref).schema
+        fields      = ['x.'+item.name for item in schema if item.name not in ['observation_source_value','value_as_string']]
+        fields      = ",".join(fields)
         sql = """
-            UPDATE :table_name
-            set :field_values
-        """.replace(":table_name",table_name).replace(":field_values",field_values)
-        
-    
+
+            SELECT :fields, x.observation_source_value, DATE_DIFF(cast(x.value_as_string as date), cast(y.value_as_string as date), DAY) as value_as_string
+            FROM raw.observation   x INNER JOIN (SELECT value_as_string,person_id from raw.observation where observation_source_value = 'ExtraConsent_TodaysDate') y ON y.person_id = x.person_id
+
+            WHERE x.person_id = 562270 AND
+                x.observation_source_value in (
+                select concept_code from raw.concept
+                where
+                vocabulary_id = ':vocabulary_id' AND REGEXP_CONTAINS(concept_code,'(date|Date|DATE)')
+                :more
+            )
+        """.replace(':vocabulary_id',self.vocabulary_id).replace(':fields',fields)
+        if self.concept_class_id is not None and len(self.concept_class_id) > 0 :
+            # codes = self.get(self.vocabulary_id)
+            codes = "'"+"','".join(self.concept_class_id)+"'"
+            codes =  " AND concept_class_id in (:codes)".replace(":codes",codes)
+        else:
+            codes = ""
+        sql = sql.replace(":more",codes)
+        print sql
+        job     = bq.QueryJobConfig()
+        otable = self.client.dataset(o_dataset).table(table_name)
+        job.destination = otable
+        # job = self.client.query(
+        #         sql,
+        #         location='US',job_config=job)    
 class BQHandler:
 	"""
 		This is a Big Query handler that is intended to serve as an interface to bq
