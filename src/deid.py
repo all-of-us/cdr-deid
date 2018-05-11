@@ -9,11 +9,26 @@
         
     It should be noted that the DRC database is hybrid rational & meta-database of sort (not sure why hybrid)
     The database will contain meta information about the data and the data as well (in most cases).
-
+    More information on metamodeling https://en.wikipedia.org/wiki/Metamodeling
+    
     Design:
     The core of the design consists in generating SQL statements that perform suppression, date-shifting and generalization.
     The queries will be compiled in an class who's role is to orchestrate the operations using joins and unions.
+    e.g :
+        If a table (relational) has a date-field and one or more arbitrary fields to be removed:
+        1. A projection will be run against the list of fields that would work minus the date fields
+        2. The date fields will be shifted given separate logic
+        3. The result of (1) and (2) will be joined on person_id (hopefully we don't need to specify a key)
 
+    e.g:
+        If a meta table with a date field needs to be removed the above operation is performed twice:
+        1. First on a subset of records filtered by records for any date type (specified as a concept)
+        2. The second subset of records contains the dates (specified by concepts) and will be shifted (row based operation)
+        3. The results of (1) and (2) will unioned. Note that (1) include a join already
+        
+    Once the Query is put together we send it to bigquery as a job that can be monitored
+
+@TODO: Add logging to have visibility into what the code is doing 
     
     
 """
@@ -101,10 +116,9 @@ class Shift (Policy):
                 self.cache[name] = p or q
                 joined_fields = [field.name for field in fields]
                 if self.cache[name] == True :
-                    # self.policies[name] = fields
-                    # sql_fields = self.__get_shifted_fields(fields)
-                    
-                    # self.policies[name]["fields"] = f
+                    #
+                    # At this point we have to perform a join on relational date fields, the dates are determined by the date at which a given candidate signed up
+                    #
                     sql = """
                         SELECT x.person_id,:fields 
                         FROM :i_dataset.observation x INNER JOIN 
@@ -112,11 +126,21 @@ class Shift (Policy):
 
                         ON __targetTable.person_id = x.person_id 
                         WHERE x.observation_source_value = 'ExtraConsent_TodaysDate'
-                        AND x.value_as_string = __targetTable.value_as_string 
+                        :additional_condition
                         AND x.person_id = 562270 
                     """.replace(":fields",sql_fields).replace(":i_dataset",dataset).replace(":table",table)
+                    #
+                    # @NOTE: If the working table is observation we should add an additional condition in the filter
+                    # This would improve the joins performance
+                    # @TODO: Find a way to re-write the query (simpler is better) and remove the condition below
+                    #
+                    
+                    if table == 'observation' :
+                        sql = sql.replace(":additional_condition"," AND x.observation_source_value = __targetTable.observation_source_value")
+                    else:
+                        sql = sql.replace(":additional_condition","")                    
                     self.policies[name] = {"join":{"sql":sql,"fields":joined_fields}}
-                
+
                 if q :
                    
                     #
@@ -250,8 +274,22 @@ class DropFields(Policy):
 class Group(Policy):
     """
         This class implements a form of generalization by grouping values for specified fields
+        This class will serve as an orchestration mechanism for generalization.
+
+        @NOTE: There an poor design issue with multi-select fields. The geniuses decided to add an additional record instead of a comma. 
+        This decision makes querying require an additional join which is very innefficient for simple retrieval and even more so for processing (e.g: de-identification)
+
     """
     pass
+class GroupGender(Policy):
+    """
+        This is multi-select enable attribute and in some cases it is stored as multiple records
+        We will only generalize the fields with  
+    """
+    def __init__(self,**args):
+        Policy.__init__(self,**args)
+    
+        
 class Orchestrator():
     """
         This class is designed to run deidentification against an OMOP table/database provided configuration
@@ -314,6 +352,8 @@ class Orchestrator():
                 sql = sql.replace(":joined_fields",join_fields)
                 fields = [field.replace('a.','') for field in fields]
                 if 'union' in r['shift']:
+                    #
+                    # we perform a union operation on this table in order to add meta data table information to the original projection
                     union_sql = r['shift']['union']['sql']
                     non_union_fields = list(set(fields) - set(r['shift']['union']['fields']))
                     non_union_fields = ",".join([' ']+non_union_fields)
