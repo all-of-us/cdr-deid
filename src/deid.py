@@ -42,12 +42,7 @@ class Policy :
         The policy hierarchy will be applied as an iterator design pattern.
     """
     META_TABLES = ['observation']
-    @staticmethod
-    def instance(**args):
-        """
-            This function will return one or severeal instances of a policies associated with the meta data
-        """
-        return None
+
     
     def __init__(self,**args):
         """
@@ -127,7 +122,7 @@ class Shift (Policy):
                         ON __targetTable.person_id = x.person_id 
                         WHERE x.observation_source_value = 'ExtraConsent_TodaysDate'
                         :additional_condition
-                        AND x.person_id = 562270 
+                        
                     """.replace(":fields",sql_fields).replace(":i_dataset",dataset).replace(":table",table)
                     #
                     # @NOTE: If the working table is observation we should add an additional condition in the filter
@@ -150,7 +145,7 @@ class Shift (Policy):
                     # I assume the only meta-table is the observation table in the case of another one more parameters need to be passed
                     #
                     union_fields = ['value_as_string']+joined_fields +['person_id']
-                    
+                    #--AND person_id = 562270
                     _sql = """
                     
                         SELECT CAST (DATE_DIFF(CAST(x.value_as_string AS DATE),CAST(y.value_as_string AS DATE),DAY) as STRING) as value_as_string, x.person_id, :shifted_fields :fields
@@ -158,7 +153,7 @@ class Shift (Policy):
                             SELECT MAX(value_as_string) as value_as_string, person_id
                             FROM :i_dataset.observation
                             WHERE observation_source_value = 'ExtraConsent_TodaysDate'
-                            AND person_id = 562270
+                            
                             GROUP BY person_id
                         ) y ON x.person_id = y.person_id 
                         
@@ -168,7 +163,7 @@ class Shift (Policy):
                             WHERE REGEXP_CONTAINS(concept_code,'(DATE|Date|date)') IS TRUE
                             
                         )
-                         AND x.person_id = 562270 
+                         
                     """.replace(":i_dataset",dataset).replace(":shifted_fields",sql_fields)
                     
                     self.policies[name]["union"] = {"sql":_sql.replace('__targetTable.',''),"fields":union_fields}
@@ -257,7 +252,7 @@ class DropFields(Policy):
                             AND REGEXP_CONTAINS(concept_code,'(Date|date|DATE)') IS FALSE
 
                         )
-                        AND person_id = 562270 
+                        
                     """.replace(":code",codes).replace(":vocabulary_id",self.vocabulary_id)
 
                 sql = sql.replace(":fields",_fields).replace(":i_dataset",dataset).replace(":table",table)
@@ -271,25 +266,111 @@ class DropFields(Policy):
     def get(self,dataset,table):
         name = dataset+"."+table
         return self.policies[name] if name in self.policies else False
+
+
 class Group(Policy):
     """
-        This class implements a form of generalization by grouping values for specified fields
-        This class will serve as an orchestration mechanism for generalization.
+        This class performs generalization against the data-model on a given table
+        The operations will apply on :
+            - gender/sex
+            - sexual orientation
+            - race
+            - education
+            - employment
+            - language
+        This is an inherently inefficient operation as a result of the design of the database that unfortunately has redudancies and semantic ambiguity (alas)
+        As such this code will proceed case by case
 
-        @NOTE: There an poor design issue with multi-select fields. The geniuses decided to add an additional record instead of a comma. 
-        This decision makes querying require an additional join which is very innefficient for simple retrieval and even more so for processing (e.g: de-identification)
-
-    """
-    pass
-class GroupGender(Policy):
-    """
-        This is multi-select enable attribute and in some cases it is stored as multiple records
-        We will only generalize the fields with  
+        @TODO: Talk with the database designers to improve the design otherwise this code may NOT scale nor be extensible
     """
     def __init__(self,**args):
+        """
+            @param path     either the path to the service account or an initialized instance of the client
+            @param sql      sql query to execute
+            @param dataset  dataset subject
+            @param table    table (subject of the operation)
+        """
         Policy.__init__(self,**args)
-    
-        
+        self.sql        = args['sql']
+        self.dataset    = args['dataset']
+        self.table      = args['table']
+        self.fields     = args['fields']
+    def race(self):
+        """
+            let's generalize race as follows all non-{white,black,asian} should be grouped as Other
+            @pre :
+                requires concept table to exist and be populated.
+        """
+        #
+        # For reasons I am unable to explain I noticed that the basic races were stored in concept table as integers
+        # The goal of the excercise is that non {white,black,asians} are stored as others.
+        # The person table has redundant information (not sure why) in race_concept_id and race_source_value
+        #
+
+        # @TODO: Make sure the observation is a general fact
+        fields = self.fields 
+        sql = "SELECT concept_id,concept_code,concept_name from :dataset.concept WHERE vocabulary_id = 'Race' AND REGEXP_CONTAINS(concept_name,'(White|Black|Asian|Other Race)') is TRUE"
+        sql = sql.replace(":dataset",self.dataset)
+        r = self.client.query(sql)
+        r = r.to_dataframe()
+        other_id= r[r['concept_name'] == 'Other Race']['concept_id'].tolist()[0]
+        _ids    = [str(value) for value in r[r['concept_name'] != 'Other Race']['concept_id'].tolist()]
+        p       = {}
+        if self.table == 'person' :
+            _ids        = ",".join(_ids)
+            other_id    = str(other_id)
+            
+            p["race_concept_id"] = "IF(race_concept_id not in (:_ids),:other_id,race_concept_id) as race_concept_id".replace(":_ids",_ids).replace(":other_id",other_id)
+            p["race_source_value"]="IF(race_concept_id not in (:_ids),'Other Race',race_source_value) as race_source_value".replace(":_ids",_ids)
+            for name in p :
+                index = fields.index(name)                
+                value = p[name]
+                if index > 0 :
+                    fields[index] = value
+            print ",".join(fields)
+        else:
+            pass
+        #
+        # let's extract the other_id
+        return None
+    def gender(self):
+        """
+            This function will generalize gender from the person table as well as the observation table
+            Other if not {M,F}            
+            
+            @NOTE : The table has fields with redundant information (shit design) i.e gender_source_value and gender_concept_id
+
+            @param dataset
+            @param table
+            @param fields
+        """
+        if self.table == 'person' :
+            #
+            # We retrieve the identifiers of the fields to be generalized
+            # The expectation is that we have {Male,Female,Other} with other having modern gender nomenclature
+            #
+            sql = "SELECT concept_id,concept_name FROM :dataset.concept WHERE REGEXP_CONTAINS(vocabulary_id, 'gender|Gender') AND concept_name not in ('FEMALE','MALE')"
+            sql = sql.replace(":dataset",self.dataset)
+            r = self.client.query(sql)
+            r = r.to_dataframe()
+            other_id = r[r['concept_name']=='OTHER']['concept_id'].values[0]                        #--
+            _ids =[str(value) for value in r[r['concept_name']!='OTHER']['concept_id'].tolist()]    #-- ids to generalize
+            fields = self.fields #args['fields']
+            p = {"gender_concept_id":"IF(gender_concept_id in ( :_ids ),:other_id,gender_concept_id) as gender_concept_id","gender_source_value": "IF(gender_concept_id in (:_ids),'O',gender_source_value) as gender_source_value"}
+            for name in p :
+                index = fields.index(name)
+                value = p[name].replace(":_ids",",".join(_ids)).replace(":other_id",str(other_id))
+                if index > 0 :
+                    fields[index] = value
+            print ",".join(fields)
+            project = self.client.project
+            # sql = ["CREATE VIEW tmp.gender_ AS ",]        
+            # name = ".".join(['`'+args['project'],args['dataset'],args['table'].'`'])
+        else:
+            #
+            # This section will handle observations
+            #
+            pass
 class Orchestrator():
     """
         This class is designed to run deidentification against an OMOP table/database provided configuration
@@ -299,7 +380,7 @@ class Orchestrator():
         @param concept_class_id
     """
     def __init__(self,**args):
-        self.actors  = [Shift(**args),DropFields(**args),Group(**args)]
+        self.actors  = [Shift(**args),DropFields(**args)] #,Group(**args)]
         self.dataset = args['dataset'] 
         self.table   = args['table']
         # self.parent_fields = args['parent_fields'] if 'parent_fields' in args else None
@@ -363,8 +444,21 @@ class Orchestrator():
                     sql = sql.replace(":fields",",".join(fields)).replace(":joined_fields",join_fields)
                     
                 pass
-            
-            print sql #.replace(":fields",fields)
+            #
+            # at this point we create a view that will serve as a basis for the shifting
+            #   
+            #
+            self.sql = "".join(["CREATE VIEW out.:table AS (",sql,")"])
+            self.fields = list(set(fields + join_fields.split(",") ) - set(['']))
+            # args = {}
+            # args['client']  = client
+            # args['sql']     = _sql
+            # args['dataset'] = self.dataset
+            # args['table']   = self.table
+            # Group(**args)
+    def generalize(self,**args):
+        pass
+            # print _sql #.replace(":fields",fields)
         # if 'dropfields' in r :
         #     fields = ",".join(r['dropfields']['fields'])
         #     sql = "SELECT :fields FROM (:sql)".replace(":sql",r['dropfields']['sql']).replace(":fields", fields)
