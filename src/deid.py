@@ -42,7 +42,9 @@ class Policy :
         The policy hierarchy will be applied as an iterator design pattern.
     """
     META_TABLES = ['observation']
-
+    class TERMS :
+        SEXUAL_ORIENTATION_STRAIGHT     = 'SexualOrientation_Straight'
+        SEXUAL_ORIENTATION_NOT_STRAIGHT = 'SexualOrientation_None'
     
     def __init__(self,**args):
         """
@@ -217,17 +219,22 @@ class DropFields(Policy):
             @param fields   list of fields that need to be dropped/suppressed from the database
         """
         Policy.__init__(self,**args)
-        self.fields = args['fields'] if 'fields' in args else []
+        # self.fields = args['fields'] if 'fields' in args else []
+        self.remove = args['remove'] if 'remove' in args else []
     def can_do(self,dataset,table):
         name = dataset+"."+table
         if name not in self.cache :
             try:
                 ref     = self.client.dataset(dataset).table(table)
                 schema  = self.client.get_table(ref).schema
-                self.fields += [field.name for field in schema if field.field_type in ['DATE','TIMESTAMP','DATETIME']]
-                self.fields = list(set(self.fields))    #-- removing duplicates from the list of fields
-                p = len(self.fields) > 0        #-- Do we have fields to remove (for physical tables)
-                q = table in Policy.META_TABLES #-- Are we dealing with a meta table
+                # self.fields += [field.name for field in schema if field.field_type in ['DATE','TIMESTAMP','DATETIME']]
+                # self.fields = list(set(self.fields))    #-- removing duplicates from the list of fields
+                # p = len(self.fields) > 0  
+                self.remove += [field.name for field in schema if field.field_type in ['DATE','TIMESTAMP','DATETIME']]
+                self.remove = list(set(self.remove))    #-- removing duplicates from the list of fields
+                
+                p = len(self.remove) > 0       #-- Do we have fields to remove (for physical tables)
+                q = table in Policy.META_TABLES #-- Are we dealing with a meta table               
                 self.cache[name] = p or q
                 sql = """
                     SELECT :fields
@@ -235,21 +242,28 @@ class DropFields(Policy):
                 """
                 
                 if p :
-                    _fields = [field.name for field in schema if field.name not in self.fields] #--fields that will be part of the projection
+                    # _fields = [field.name for field in schema if field.name not in self.fields] #--fields that will be part of the projection
+                    _fields = [field.name for field in schema if field.name not in self.remove] 
                     lfields = list(_fields)
                     _fields = ",".join(_fields)
                 else:
                     _fields = "*"
                     lfields = [field.name for field in schema]
                 if q :
+                    #
+                    # We are dealing with observation / meta table. Certain rows have to be removed due to the fact that it's a meta-table
+                    #   - Date  because they will be shifted
+                    #   - {Race,Gender,Ethnicity, Education, Employment, Language, Sexual Orientation} because they will be generalized
+                    # As a result of filtering out the above fields, we need to run a cascading Unions of which each will have its dates shifted.
+                    #
                     codes = "'"+"','".join(self.concept_class_id)+"'"
                     sql = sql + """
 
-                        WHERE observation_source_value in (
-                            SELECT concept_code 
+                        WHERE observation_source_concept_id in (
+                            SELECT concept_id 
                             FROM :i_dataset.concept 
                             WHERE vocabulary_id = ':vocabulary_id' AND concept_class_id in (:code)
-                            AND REGEXP_CONTAINS(concept_code,'(Date|date|DATE)') IS FALSE
+                            AND REGEXP_CONTAINS(concept_code,'(Date|Gender|Race|Ethnicity|Employment|Orientation|Education)') IS FALSE
 
                         )
                         
@@ -259,7 +273,7 @@ class DropFields(Policy):
                 self.policies[name] = {"sql":sql,"fields":lfields}
                
                 
-        
+          
             except Exception,e:
                 print e
         return self.cache [name]
@@ -295,6 +309,18 @@ class Group(Policy):
         self.dataset    = args['dataset']
         self.table      = args['table']
         self.fields     = args['fields']
+    def get_fields(self,p):
+        """
+            This function returns the field list with generalized expressions of the fields
+            @param p    mapping parameter of fields and associated expressions
+        """
+        fields = list(self.fields)
+        for name in p :
+            index = fields.index(name)                
+            value = p[name]
+            if index > 0 :
+                fields[index] = value
+        return fields
     def race(self):
         """
             let's generalize race as follows all non-{white,black,asian} should be grouped as Other
@@ -308,28 +334,48 @@ class Group(Policy):
         #
 
         # @TODO: Make sure the observation is a general fact
+        
+        #
+        # We retrieve the identifiers of all the known races {black,white,asian,other} and anything that doesn't belong will be other
+        # @NOTE:
+        #   For some unknown reason (poor design) it would appear that on tables like person concept_name holds the value of the race whereas in observation table concept_code holds the value of the race
+        # This is an unacceptable inconcsistency that make make data broadly available with different representations thus increasing the risk of re-identification.
+        #
+        
+        field_name = "concept_name" if self.table == 'person' else 'concept_code'
         fields = self.fields 
-        sql = "SELECT concept_id,concept_code,concept_name from :dataset.concept WHERE vocabulary_id = 'Race' AND REGEXP_CONTAINS(concept_name,'(White|Black|Asian|Other Race)') is TRUE"
+        sql = "SELECT concept_id,concept_code,concept_name from :dataset.concept WHERE REGEXP_CONTAINS(vocabulary_id,'(PPI|Race)') AND REGEXP_CONTAINS(concept_name,'(White|Black|Asian|Other Race)') is TRUE AND REGEXP_CONTAINS(concept_name,'(Native|Pacific)') is FALSE"
         sql = sql.replace(":dataset",self.dataset)
         r = self.client.query(sql)
         r = r.to_dataframe()
         other_id= r[r['concept_name'] == 'Other Race']['concept_id'].tolist()[0]
+        other_name= r[r['concept_name'] == 'Other Race']['concept_name'].tolist()[0]
         _ids    = [str(value) for value in r[r['concept_name'] != 'Other Race']['concept_id'].tolist()]
+        #
+        # Formatting the fields to perform the generalization of the  of the a person
+        #
+        _ids        = ",".join(_ids)
+        other_id    = str(other_id)
+        
         p       = {}
         if self.table == 'person' :
-            _ids        = ",".join(_ids)
-            other_id    = str(other_id)
             
             p["race_concept_id"] = "IF(race_concept_id not in (:_ids),:other_id,race_concept_id) as race_concept_id".replace(":_ids",_ids).replace(":other_id",other_id)
-            p["race_source_value"]="IF(race_concept_id not in (:_ids),'Other Race',race_source_value) as race_source_value".replace(":_ids",_ids)
-            for name in p :
-                index = fields.index(name)                
-                value = p[name]
-                if index > 0 :
-                    fields[index] = value
-            print ",".join(fields)
+            p["race_source_value"]="IF(race_concept_id not in (:_ids),':other_name',race_source_value) as race_source_value".replace(":_ids",_ids).replace(":other_name",other_name)
+            
+            # return self.get_fields(p)
+
         else:
-            pass
+            #
+            # Let's generalize race and everything that goes with
+            # @TODO: Figure out cases for multiple races
+            p['value_as_string'] = "IF(value_source_concept_id not in (:_ids),':other_name',value_as_string) as value_as_string".replace(":_ids",_ids).replace(":other_name",other_name)
+            p['observation_source_concept_id'] = "IF(value_source_concept_id not in (:_ids),:other_id,observation_source_concept_id) as observation_source_concept_id".replace(":_ids",_ids).replace(":other_id",other_id)
+            p['observation_source_value'] = "IF(value_source_concept_id not in (:_ids), ':other_name',observation_source_value) as observation_source_value".replace(":_ids",_ids).replace(":other_name",other_name)
+            p['value_source_value'] = "IF(value_source_concept_id not in (:_ids), ':other_name',value_source_value) as value_source_value".replace(":_ids",_ids).replace(":other_name",other_name)
+
+           
+        return self.get_fields(p)
         #
         # let's extract the other_id
         return None
@@ -344,33 +390,75 @@ class Group(Policy):
             @param table
             @param fields
         """
+        sql = "SELECT concept_id,concept_name FROM :dataset.concept WHERE (vocabulary_id= 'Gender' AND concept_name not in ('FEMALE','MALE') ) OR REGEXP_CONTAINS(concept_code,'_Man|_Woman')"
+        sql = sql.replace(":dataset",self.dataset)
+        r = self.client.query(sql)
+        r = r.to_dataframe()
+        
+        other_id = str(r[r['concept_name']=='OTHER']['concept_id'].values[0])                        #--
+        other_name = r[r['concept_name']=='OTHER']['concept_name'].values[0]                      #--
+        _ids =",".join([str(value) for value in r[r['concept_name']!='OTHER']['concept_id'].tolist()])    #-- ids to generalize
+        fields = self.fields #args['fields']
+        
+        p = {}
         if self.table == 'person' :
             #
             # We retrieve the identifiers of the fields to be generalized
             # The expectation is that we have {Male,Female,Other} with other having modern gender nomenclature
             #
-            sql = "SELECT concept_id,concept_name FROM :dataset.concept WHERE REGEXP_CONTAINS(vocabulary_id, 'gender|Gender') AND concept_name not in ('FEMALE','MALE')"
-            sql = sql.replace(":dataset",self.dataset)
-            r = self.client.query(sql)
-            r = r.to_dataframe()
-            other_id = r[r['concept_name']=='OTHER']['concept_id'].values[0]                        #--
-            _ids =[str(value) for value in r[r['concept_name']!='OTHER']['concept_id'].tolist()]    #-- ids to generalize
-            fields = self.fields #args['fields']
-            p = {"gender_concept_id":"IF(gender_concept_id in ( :_ids ),:other_id,gender_concept_id) as gender_concept_id","gender_source_value": "IF(gender_concept_id in (:_ids),'O',gender_source_value) as gender_source_value"}
-            for name in p :
-                index = fields.index(name)
-                value = p[name].replace(":_ids",",".join(_ids)).replace(":other_id",str(other_id))
-                if index > 0 :
-                    fields[index] = value
-            print ",".join(fields)
-            project = self.client.project
-            # sql = ["CREATE VIEW tmp.gender_ AS ",]        
-            # name = ".".join(['`'+args['project'],args['dataset'],args['table'].'`'])
+            p ["gender_concept_id"] = "IF(gender_concept_id in ( :_ids ),:other_id,gender_concept_id) as gender_concept_id".replace(":_ids",_ids).replace(":other_id",other_id)
+            p ["gender_source_value"]= "IF(gender_concept_id in (:_ids),:other_name,gender_source_value) as gender_source_value".replace(":_ids",_ids).replace(":other_name",other_name)
+            # for name in p :
+            #     index = fields.index(name)
+            #     value = p[name].replace(":_ids",",".join(_ids)).replace(":other_id",str(other_id))
+            #     if index > 0 :
+            #         fields[index] = value
+            # return fields
         else:
             #
             # This section will handle observations
             #
-            pass
+            p['value_as_string'] = "IF(value_source_concept_id not in (:_ids),':other_name',value_as_string) as value_as_string".replace(":_ids",_ids).replace(":other_name",other_name)
+            p['observation_source_concept_id'] = "IF(value_source_concept_id not in (:_ids),:other_id,observation_source_concept_id) as observation_source_concept_id".replace(":_ids",_ids).replace(":other_id",other_id)
+            p['observation_source_value'] = "IF(value_source_concept_id not in (:_ids), ':other_name',observation_source_value) as observation_source_value".replace(":_ids",_ids).replace(":other_name",other_name)
+            p['value_source_value'] = "IF(value_source_concept_id not in (:_ids), ':other_name',value_source_value) as value_source_value".replace(":_ids",_ids).replace(":other_name",other_name)
+        return self.get_fields(p)
+    def __get_formatted_observations(self,_ids,other_name,other_id) :
+       
+        _ids = ",".join(_ids) if isinstance(_ids,list) else _ids        
+        other_id = str(other_id) if isinstance(other_id,int) else other_id
+        other_name = other_name.replace("'","\\'")
+        p = {}
+        p['value_as_string'] = "IF(value_source_concept_id not in (:_ids),':other_name',value_as_string) as value_as_string".replace(":_ids",_ids).replace(":other_name",other_name)
+        p['observation_source_concept_id'] = "IF(value_source_concept_id not in (:_ids),:other_id,observation_source_concept_id) as observation_source_concept_id".replace(":_ids",_ids).replace(":other_id",other_id)
+        p['observation_source_value'] = "IF(value_source_concept_id not in (:_ids), ':other_name',observation_source_value) as observation_source_value".replace(":_ids",_ids).replace(":other_name",other_name)
+        p['value_source_value'] = "IF(value_source_concept_id not in (:_ids), ':other_name',value_source_value) as value_source_value".replace(":_ids",_ids).replace(":other_name",other_name)
+        return self.get_fields(p)
+    def ethnicity(self):
+        """
+            This function generalizes the ethnicity of an individual i.e 
+            an ethnicity can be {hispanic or latino, not hispnaic or latino}
+            @NOTE: This will be dropped !!
+        """
+        return None
+    def orientation(self):
+        """
+            This function will generalize sexual orientation on the observation table, this only applies to the observation table (for now)
+        """
+        sql = "SELECT concept_id,concept_code,concept_name from :dataset.concept where REGEXP_CONTAINS(concept_code, 'Orientation_Straight|Orientation_None')"
+        sql = sql.replace(":dataset",self.dataset)
+        r = self.client.query(sql)
+        r = r.to_dataframe()
+       
+        other_id = str(r[r['concept_code'] == Policy.TERMS.SEXUAL_ORIENTATION_NOT_STRAIGHT]['concept_id'].tolist()[0])                        #--
+    
+        other_name = r[r['concept_code']==Policy.TERMS.SEXUAL_ORIENTATION_NOT_STRAIGHT]['concept_code'].tolist()[0]  
+        #                     #--
+        _ids =[str(value) for value in r[r['concept_code'] ==Policy.TERMS.SEXUAL_ORIENTATION_STRAIGHT]['concept_id'].tolist()]    #-- ids to generalize
+        
+        fields = self.fields
+        return self.__get_formatted_observations(_ids,other_name,other_id)
+        
 class Orchestrator():
     """
         This class is designed to run deidentification against an OMOP table/database provided configuration
@@ -383,6 +471,7 @@ class Orchestrator():
         self.actors  = [Shift(**args),DropFields(**args)] #,Group(**args)]
         self.dataset = args['dataset'] 
         self.table   = args['table']
+        self.sql     = None
         # self.parent_fields = args['parent_fields'] if 'parent_fields' in args else None
         self.setup()
     def setup(self):
@@ -393,8 +482,7 @@ class Orchestrator():
         r       = {}
         for item in self.actors :
             name    = item.name()
-            p       =  item.can_do(self.dataset,self.table)
-            # print [name,self.dataset+'.'+self.table,p]
+            p       =  item.can_do(self.dataset,self.table)          
             if p :
                 r[name] = item.get(self.dataset,self.table)
             else:
