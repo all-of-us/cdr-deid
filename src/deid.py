@@ -45,6 +45,7 @@ class Policy :
     class TERMS :
         SEXUAL_ORIENTATION_STRAIGHT     = 'SexualOrientation_Straight'
         SEXUAL_ORIENTATION_NOT_STRAIGHT = 'SexualOrientation_None'
+        OBSERVATION_FILTERS = {"race":'Race_WhatRace',"gender":'Gender',"orientation":'Orientation',"employment":'_EmploymentStatus',"sex_at_birth":'BiologicalSexAtBirth_SexAtBirth',"language":'Language_SpokenWrittenLanguage',"education":'EducationLevel_HighestGrade'}
     
     def __init__(self,**args):
         """
@@ -133,7 +134,7 @@ class Shift (Policy):
                     #
                     
                     if table == 'observation' :
-                        sql = sql.replace(":additional_condition"," AND x.observation_source_value = __targetTable.observation_source_value")
+                        sql = sql.replace(":additional_condition"," AND x.observation_id = __targetTable.observation_id")
                     else:
                         sql = sql.replace(":additional_condition","")                    
                     self.policies[name] = {"join":{"sql":sql,"fields":joined_fields}}
@@ -157,6 +158,8 @@ class Shift (Policy):
                             WHERE observation_source_value = 'ExtraConsent_TodaysDate'
                             
                             GROUP BY person_id
+                            ORDER BY 1 DESC
+                            LIMIT 1
                         ) y ON x.person_id = y.person_id 
                         
                         WHERE observation_source_value in (
@@ -257,19 +260,46 @@ class DropFields(Policy):
                     # As a result of filtering out the above fields, we need to run a cascading Unions of which each will have its dates shifted.
                     #
                     codes = "'"+"','".join(self.concept_class_id)+"'"
+                    sql_filter = "Date|"+ "|".join(Policy.TERMS.OBSERVATION_FILTERS.values())
+                    # filter = 'Date|Gender|Race|Ethnicity|Employment|Orientation|Education'
                     sql = sql + """
 
                         WHERE observation_source_concept_id in (
                             SELECT concept_id 
                             FROM :i_dataset.concept 
                             WHERE vocabulary_id = ':vocabulary_id' AND concept_class_id in (:code)
-                            AND REGEXP_CONTAINS(concept_code,'(Date|Gender|Race|Ethnicity|Employment|Orientation|Education)') IS FALSE
-
+                            
+                            AND REGEXP_CONTAINS(concept_code,'(:filter)') IS FALSE
                         )
-                        
-                    """.replace(":code",codes).replace(":vocabulary_id",self.vocabulary_id)
 
+                        
+                    """.replace(":code",codes).replace(":vocabulary_id",self.vocabulary_id).replace(":filter",sql_filter)
+                    #
+                    #   We are now having to generalize rows that were filtered out (done in a loop)
+                    #   These queries will be unioned in the end.
+                    #
+                    xsql = [sql]
+                    args = {"client":self.client,"dataset":dataset,"table":table,"fields":_fields,"sql":"","concept_source_id":[],"vocabulary_id":"","concept_class_id":[]}
+                    handler = Group(**args)
+                    for key in Policy.TERMS.OBSERVATION_FILTERS :
+                        
+                        pointer = getattr(handler,key)
+                        r = pointer()
+                        
+                        if len(r.keys()) > 0 :
+                            ofields = [ r[fname] if fname in r else fname for fname in lfields]
+                            
+                            _sql_ = "SELECT :fields FROM :i_dataset.:table WHERE observation_source_concept_id in (SELECT concept_id FROM :i_dataset.concept WHERE REGEXP_CONTAINS(concept_code,'(?i):key')) "
+                            _sql_ = _sql_.replace(":fields",",".join(ofields)).replace(":table",table).replace(":key",key).replace(":i_dataset",dataset)
+                            
+                            xsql.append( " UNION ALL "+_sql_ )
+                            break
+                            
+                    sql =  "SELECT :fields from (" +" ".join(xsql) +") GROUP BY :fields"
                 sql = sql.replace(":fields",_fields).replace(":i_dataset",dataset).replace(":table",table)
+                
+                
+                    
                 self.policies[name] = {"sql":sql,"fields":lfields}
                
                 
@@ -308,19 +338,30 @@ class Group(Policy):
         self.sql        = args['sql']
         self.dataset    = args['dataset']
         self.table      = args['table']
-        self.fields     = args['fields']
+        if isinstance(args['fields'],basestring) :
+            self.fields = args['fields'].split(',')
+        else:
+            self.fields     = args['fields']
+
     def get_fields(self,p):
         """
             This function returns the field list with generalized expressions of the fields
             @param p    mapping parameter of fields and associated expressions
         """
+        
         fields = list(self.fields)
+        r = {}
         for name in p :
-            index = fields.index(name)                
-            value = p[name]
-            if index > 0 :
+            
+                     
+            if name in fields:
+                index = fields.index(name)    
+                value = p[name]
                 fields[index] = value
-        return fields
+                r[name] = value
+        # return fields
+        
+        return r
     def race(self):
         """
             let's generalize race as follows all non-{white,black,asian} should be grouped as Other
@@ -333,7 +374,7 @@ class Group(Policy):
         # The person table has redundant information (not sure why) in race_concept_id and race_source_value
         #
 
-        # @TODO: Make sure the observation is a general fact
+        # @TODO: Multiple races (add this)
         
         #
         # We retrieve the identifiers of all the known races {black,white,asian,other} and anything that doesn't belong will be other
@@ -444,6 +485,7 @@ class Group(Policy):
     def orientation(self):
         """
             This function will generalize sexual orientation on the observation table, this only applies to the observation table (for now)
+            @filter    TheBasics_SexualOrientation
         """
         sql = "SELECT concept_id,concept_code,concept_name from :dataset.concept where REGEXP_CONTAINS(concept_code, 'Orientation_Straight|Orientation_None')"
         sql = sql.replace(":dataset",self.dataset)
@@ -457,6 +499,64 @@ class Group(Policy):
         _ids =[str(value) for value in r[r['concept_code'] ==Policy.TERMS.SEXUAL_ORIENTATION_STRAIGHT]['concept_id'].tolist()]    #-- ids to generalize
         
         fields = self.fields
+        
+        return self.__get_formatted_observations(_ids,other_name,other_id)
+    def education(self):
+        """
+            Educattion should be in 5 categories provided by the concept_codes below. Because we do NOT have an unknown education level we will hard code it and set it's concept id to zero (No matching concept)
+            @TODO:
+            The data curation team should add this in the concept table (put in a request with Mark or Chun Yee)
+        """
+        sql = "SELECT concept_id,concept_code,concept_name from :dataset.concept WHERE concept_code in ('HighestGrade_AdvancedDegree','HighestGrade_CollegeOnetoThree','HighestGrade_TwelveOrGED','HighestGrade_NeverAttended')"        
+        other_id = '0'
+        other_name = 'Unknown'
+        sql = sql.replace(":dataset",self.dataset)
+        r = self.client.query(sql)
+        r = r.to_dataframe()        
+        _ids = [str(value) for value in r['concept_id'].tolist()]
+        
+        return self.__get_formatted_observations(_ids,other_name,other_id)
+    def sex_at_birth(self):
+        """
+            This function will perform sex at birth generalization against the observation table
+            @filter value_source_concept_id in (SELECT concept_id from :dataset.concept WHERE concept_code = 'BiologicalSexAtBirth_SexAtBirth')
+        """
+        sql = "SELECT concept_id,concept_code,concept_name from :dataset.concept WHERE  concept_code in ('SexAtBirth_Female', 'SexAtBirth_Male')"
+        other_id = '0'
+        other_name = 'Unknown'
+        sql = sql.replace(":dataset",self.dataset)
+        r = self.client.query(sql)
+        r = r.to_dataframe()        
+        _ids = [str(value) for value in r['concept_id'].tolist()]
+        
+        return self.__get_formatted_observations(_ids,other_name,other_id)
+
+    def language(self):
+        """
+            filter by SpokenWrittenLanguage_
+        """
+        sql = "SELECT concept_id,concept_code,concept_name from :dataset.concept WHERE REGEXP_CONTAINS(concept_code,'Language_English')"
+        other_id = '0'
+        other_name = 'Unknown'
+        sql = sql.replace(":dataset",self.dataset)
+        r = self.client.query(sql)
+        r = r.to_dataframe()        
+        _ids = [str(value) for value in r['concept_id'].tolist()]
+        
+        return self.__get_formatted_observations(_ids,other_name,other_id)
+    def employment(self):
+        """
+            This function will generalize employment
+            This will have to be filtered by _EmploymentStatus
+        """
+        sql = "SELECT concept_id,concept_code,concept_name from :dataset.concept WHERE concept_code in ('EmploymentStatus_OutOfWorkOneOrMore','EmploymentStatus_EmployedForWages','EmploymentStatus_OutOfWorkLessThanOne')"
+        other_id = '0'
+        other_name = 'Unknown'
+        sql = sql.replace(":dataset",self.dataset)
+        r = self.client.query(sql)
+        r = r.to_dataframe()        
+        _ids = [str(value) for value in r['concept_id'].tolist()]
+        
         return self.__get_formatted_observations(_ids,other_name,other_id)
         
 class Orchestrator():
@@ -514,7 +614,12 @@ class Orchestrator():
                     sql = sql.replace(":parent_fields",top_prefixed_fields)
                     join_sql = r['shift']['join']['sql']
                     join_fields = ",".join(['']+r['shift']['join']['fields']) #-- should start with comma
-                    sql = sql + " INNER JOIN (:sql) p ON p.person_id  = a.person_id".replace(":sql",join_sql)
+                    sql = sql + " INNER JOIN (:sql) p ON p.person_id  = a.person_id ".replace(":sql",join_sql)
+                    #
+                    # If we are dealing with observations we should tie down this record
+                    #
+                    # if 'observation_id' in fields :
+                    #     sql += " "
 
                 else:
                     join_fields = ""    
@@ -536,7 +641,7 @@ class Orchestrator():
             # at this point we create a view that will serve as a basis for the shifting
             #   
             #
-            self.sql = "".join(["CREATE VIEW out.:table AS (",sql,")"])
+            self.sql = sql #"".join(["CREATE VIEW out.:table AS (",sql,")"])
             self.fields = list(set(fields + join_fields.split(",") ) - set(['']))
             # args = {}
             # args['client']  = client
