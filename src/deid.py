@@ -12,8 +12,15 @@
     More information on metamodeling https://en.wikipedia.org/wiki/Metamodeling
     
     Design:
-    The core of the design consists in generating SQL statements that perform suppression, date-shifting and generalization.
-    The queries will be compiled in an class who's role is to orchestrate the operations using joins and unions.
+    Performing de-identification is a a “chatty” process as consisting of joins over joins over joins ... (depending on the operation)
+    e.g : In order to determine a person’s race two joins are required, one that determines the number of races and the other if the races should be generalized. 
+    This chatty process has to be performed for every individual on a single field that is being de-identified. There are other fields that require more joins.
+
+    As a result of the chatty nature of the operations and the quota limitations imposed by bigquery. 
+    We implemented a query builder that will build an SQL query that will de-identify a designated table. 
+        - This keeps the communication with bigquery to the absolute minimum, 
+        - Once the DEID query is built it is submitted to bigquery as a job that will handle parallelization and other optimizations.
+    
     e.g :
         If a table (relational) has a date-field and one or more arbitrary fields to be removed:
         1. A projection will be run against the list of fields that would work minus the date fields
@@ -33,8 +40,29 @@
     
 """
 from __future__ import division
+import sys
 import json
 from google.cloud import bigquery as bq
+
+#
+# Let's process the arguments passed in via the command-line
+# We expect the program to be run as follows : python deid.py --i_dataset <input_dataset> --table <table_name> --config path-of-config.json --log
+#
+SYS_ARGS = {}
+if len(sys.argv) > 1:
+	
+	N = len(sys.argv)
+	for i in range(1,N):
+		value = None
+		if sys.argv[i].startswith('--'):
+			key = sys.argv[i].replace('-','')
+			SYS_ARGS[key] = 1
+			if i + 1 < N:
+				value = sys.argv[i + 1] = sys.argv[i+1].strip()
+			if key and value:
+				SYS_ARGS[key] = value
+		
+		i += 2
 
 class Policy :
     """
@@ -46,6 +74,7 @@ class Policy :
         SEXUAL_ORIENTATION_STRAIGHT     = 'SexualOrientation_Straight'
         SEXUAL_ORIENTATION_NOT_STRAIGHT = 'SexualOrientation_None'
         OBSERVATION_FILTERS = {"race":'Race_WhatRace',"gender":'Gender',"orientation":'Orientation',"employment":'_EmploymentStatus',"sex_at_birth":'BiologicalSexAtBirth_SexAtBirth',"language":'Language_SpokenWrittenLanguage',"education":'EducationLevel_HighestGrade'}
+
     
     def __init__(self,**args):
         """
@@ -251,6 +280,10 @@ class DropFields(Policy):
                 else:
                     _fields = "*"
                     lfields = [field.name for field in schema]
+                #
+                # @Log: We are logging here the operaton that is expected to take place
+                # {"action":"drop-fields","input":self.remove,"subject":table,"object":"columns"}
+                
                 if q :
                     #
                     # We are dealing with observation / meta table. Certain rows have to be removed due to the fact that it's a meta-table
@@ -260,6 +293,10 @@ class DropFields(Policy):
                     #
                     codes = "'"+"','".join(self.concept_class_id)+"'"
                     sql_filter = "Date|"+ "|".join(Policy.TERMS.OBSERVATION_FILTERS.values())
+                    #
+                    # @Log: We are logging here the operaton that is expected to take place
+                    # {"action":"drop-fields","input":sql_filter,"subject":table,"object":"rows"}
+                    
                     # filter = 'Date|Gender|Race|Ethnicity|Employment|Orientation|Education'
                     sql = sql + """
 
@@ -663,15 +700,127 @@ class Orchestrator():
             # print sql.replace(":fields",fields)
 
 
+#
+# 
+#             
+if __name__ == '__main__' :
+    #
+    # Overriding config path with the actual configuration file and making sure it is available for use
+    #
+    path = SYS_ARGS['config']
+    f = open(path)
+    SYS_ARGS['config'] = json.loads(f.read())
+    f.close()
+    #
+    # Once the configuration is available we can begin to create objects to do the work.
+    #   - google cloud client
+    #   - Initialize class level parameters
+    #
+    CONSTANTS = SYS_ARGS['constants']
+    account_path = CONSTANTS['service-account-path']    
+    Policy.TERMS.SEXUAL_ORIENTATION_NOT_STRAIGHT= CONSTANTS['sexual-orientation']['not-straight']
+    Policy.TERMS.SEXUAL_ORIENTATION_STRAIGHT    = CONSTANTS['sexual-orientation']['straight']
+    Policy.TERMS.OBSERVATION_FILTERS            = CONSTANTS['observation-filters']
+    client = bq.Client.from_service_account_json(account_path)
+
+    #
+    # Let's get the information about the dataset available
+    i_dataset   = SYS_ARGS['i_dataset']
+    table       = SYS_ARGS['table']    
+    o_dataset   = SYS_ARGS['o_dataset']
+    remove      = SYS_ARGS['suppression'][table] if table in SYS_ARGS['suppression'] else []
+    #
+    # The operation will be performed via the implementation of a form of iterator-design pattern
+    # design information here https://en.wikipedia.org/wiki/Iterator_pattern
+    #
+    #
+    # @TODO: perhaps vocabulary_id and constant_class_id can be removed
+    #
+    args = {"client":client,"vocabulary_id"='PPI',"concept_class_id"=['Question','PPI Modifier'],"dataset"=i_dataset,table=table,"remove"=remove}
+    container = [Shift(**args),DropFields(**args)]
+    #
+    # Let's see what we can do with the designated table, given our container of operations
+    # Each item in the container is fully autonomous and will return a query that will have to be built by the calling code
+    # The reason for this is because the operations are already convoluted as is: separation of concerns (https://en.wikipedia.org/wiki/Separation_of_concerns)
+    #
+    r       = {}
+    for item in container :
+        name    = item.name()
+        p       =  item.can_do(self.dataset,self.table)          
+        if p :
+            r[name] = item.get(self.dataset,self.table)
+        else:
+            continue
+    #
+    # At this point we should start building the query i.e performing joins and unions
+    #   - dropping fields performs a projection of a table given fields suppressed (should probably be renamed). Date/TimeStamp fields will be automatically dropped if not specified
+    #   - Dates are shifted and will/should be joined against the fields of the previous step
+    #   - In the advent of observation table (meta and relational) an additional union is added to the construction process
+    #
+
+    #
+    # Let's get basic project of fields and provide a prefix to the query
+    #
+    fields =  r['dropfields']['fields']
+    sql = "SELECT :parent_fields FROM ("+r['dropfields']['sql']+") a"
+    #
+    # @Log: We are logging here the operaton that is expected to take place
+    # {"action":"building-sql","input":fields,"subject":table,"object":""}
+    
+
+    if 'shift' in r :
+        if 'join' in r['shift'] :
+            #
+            # @Log: We are logging here the operaton that is expected to take place
+            # {"action":"building-sql","input":fields,"subject":table,"object":"join"}
+            prefixed_fields = ['a.'+name for name in fields if name not in r['shift']['join']['fields']]            
+            prefixed_fields += r['shift']['join']['fields']
             
-#handler = BQHandler('config/account/account.json')
-#handler.meta('raw','concept')
-# client = bq.Client.from_service_account_json('/home/steve/git/rdc/deid/config/account/account.json')
-
-# h = Shift(client=client,vocabulary_id='PPI',concept_class_id=['Question','PPI Modifier'])
-# [h.vocabulary_id,h.concept_sql]
-# r = h.can_do('raw','observation')
-# print h.get('raw','observation')['fields']
-
-# h = Orchestrator(client=client,vocabulary_id='PPI',concept_class_id=['Question','PPI Modifier'],dataset='raw',table='observation',fields=['value_as_number'])
-
+            prefixed_fields = ",".join(prefixed_fields)
+            
+            join_sql = r['shift']['join']['sql']
+            join_fields = ",".join(['']+r['shift']['join']['fields']) #-- should start with comma
+            sql = sql + " INNER JOIN (:sql) p ON p.person_id = a.person_id ".replace(":sql",join_sql)
+        else:
+            prefixed_fields = ['a.'+name for name in fields if name not in fields ]
+            join_fields = ""
+        
+        sql = sql.replace(":parent_fields",prefixed_fields)    
+        
+        if 'union' in r['shift'] :
+            #
+            # @Log: We are logging here the operaton that is expected to take place
+            # {"action":"building-sql","input":fields,"subject":table,"object":"union"}
+            union_sql = r['shift']['union']['sql']
+            non_union_fields = list(set(fields) - set(r['shift']['union']['fields']))
+            non_union_fields = ",".join([' ']+non_union_fields)
+            union_sql = union_sql.replace(":fields",non_union_fields)
+            sql = sql + " UNION ALL SELECT :fields :joined_fields FROM ( :sql ) ".replace(":sql",union_sql)    
+            
+            sql = sql.replace(":fields",",".join(fields)).replace(":joined_fields",join_fields)            
+            
+        else:
+            pass
+    #
+    # At this point we should submit the sql query with information about the target
+    #
+    fields = ",".join(fields) + join_fields 
+    if 'filter' in SYS_ARGS :
+        #
+        # @Log: We are logging here the operaton that is expected to take place
+        # {"action":"building-sql","input":fields,"subject":table,"object":"filter"}
+        
+        sql = "SELECT * FROM ("+sql+") WHERE "+SYS_ARGS['filter']
+    #
+    # @Log: We are logging here the operaton that is expected to take place
+    # {"action":"submit-sql","input":fields,"subject":table,"object":"bq"}      
+    
+    #
+    # @TODO: Make sure the o_dataset exists if it doesn't just create it (it's simpler)  
+    #
+    job = bq.QueryJobConfig()
+    job.destination = client.dataset(o_dataset).table(table)
+    client.query(sql,location='US',job_config=job)
+    
+    #@TODO: monitor jobs once submitted
+    pass
