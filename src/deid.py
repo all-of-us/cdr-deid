@@ -148,6 +148,7 @@ class Shift (Policy):
                     # I assume the only meta-table is the observation table in the case of another one more parameters need to be passed
                     #
                     union_fields = ['value_as_string']+joined_fields +['person_id']
+                
                     #--AND person_id = 562270
                     _sql = """
                     
@@ -158,8 +159,6 @@ class Shift (Policy):
                             WHERE observation_source_value = 'ExtraConsent_TodaysDate'
                             
                             GROUP BY person_id
-                            ORDER BY 1 DESC
-                            LIMIT 1
                         ) y ON x.person_id = y.person_id 
                         
                         WHERE observation_source_value in (
@@ -293,9 +292,9 @@ class DropFields(Policy):
                             _sql_ = _sql_.replace(":fields",",".join(ofields)).replace(":table",table).replace(":key",key).replace(":i_dataset",dataset)
                             
                             xsql.append( " UNION ALL "+_sql_ )
-                            break
                             
-                    sql =  "SELECT :fields from (" +" ".join(xsql) +") GROUP BY :fields"
+                            
+                    sql =  " SELECT :fields from (" +" ".join(xsql) +") GROUP BY :fields"
                 sql = sql.replace(":fields",_fields).replace(":i_dataset",dataset).replace(":table",table)
                 
                 
@@ -614,7 +613,7 @@ class Orchestrator():
                     sql = sql.replace(":parent_fields",top_prefixed_fields)
                     join_sql = r['shift']['join']['sql']
                     join_fields = ",".join(['']+r['shift']['join']['fields']) #-- should start with comma
-                    sql = sql + " INNER JOIN (:sql) p ON p.person_id  = a.person_id ".replace(":sql",join_sql)
+                    sql = sql + " INNER JOIN (:sql) p ON p.person_id = a.person_id ".replace(":sql",join_sql)
                     #
                     # If we are dealing with observations we should tie down this record
                     #
@@ -632,10 +631,10 @@ class Orchestrator():
                     non_union_fields = list(set(fields) - set(r['shift']['union']['fields']))
                     non_union_fields = ",".join([' ']+non_union_fields)
                     union_sql = union_sql.replace(":fields",non_union_fields)
-                    sql = sql + " UNION ALL SELECT :fields :joined_fields FROM ( :sql ) ".replace(":sql",union_sql)
-                    # sql = union_sql
-                    sql = sql.replace(":fields",",".join(fields)).replace(":joined_fields",join_fields)
+                    sql = sql + " UNION ALL SELECT :fields :joined_fields FROM ( :sql ) ".replace(":sql",union_sql)    
                     
+                    sql = sql.replace(":fields",",".join(fields)).replace(":joined_fields",join_fields)
+                    pass
                 pass
             #
             # at this point we create a view that will serve as a basis for the shifting
