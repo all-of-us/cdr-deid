@@ -35,6 +35,7 @@
         
     Once the Query is put together we send it to bigquery as a job that can be monitored
 
+    Usage
 @TODO: Add logging to have visibility into what the code is doing 
     
     
@@ -820,7 +821,10 @@ if __name__ == '__main__' :
     #
     job = bq.QueryJobConfig()
     job.destination = client.dataset(o_dataset).table(table)
-    client.query(sql,location='US',job_config=job)
-    
+    r = client.query(sql,location='US',job_config=job)
+    #
+    # @Log: We are logging here the operaton that is expected to take place
+    # {"action":"submit-sql","input":job.job_id,"subject":table,"object":{"status":job.state,"running""job.running}}     
+        
     #@TODO: monitor jobs once submitted
     pass
