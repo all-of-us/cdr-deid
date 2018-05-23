@@ -5,22 +5,21 @@
     This file implements the deidentification policy for the All of Us project. This is a rule based approach:
         - Suppression of PPI, EHR, PM
         - Date Shifting
-        - Generalization of certain fields (Zip, ICD9)
+        - Generalization of certain fields (race, gender, ...)
         
     It should be noted that the DRC database is hybrid rational & meta-database of sort (not sure why hybrid)
     The database will contain meta information about the data and the data as well (in most cases).
     More information on metamodeling https://en.wikipedia.org/wiki/Metamodeling
     
     Design:
-    Performing de-identification is a a “chatty” process as consisting of joins over joins over joins ... (depending on the operation)
-    e.g : In order to determine a person’s race two joins are required, one that determines the number of races and the other if the races should be generalized. 
-    This chatty process has to be performed for every individual on a single field that is being de-identified. There are other fields that require more joins.
+    Performing de-identification is a "chatty" process as consisting of joins over joins over joins ... depending on the operations.
+    e.g: In order to determine a person's race two joins are required, one that determines the number of races and the other if the races should be generalized.
+    This chatty process to be performed for every individual and on a every field subject to de-identification.
 
-    As a result of the chatty nature of the operations and the quota limitations imposed by bigquery. 
-    We implemented a query builder that will build an SQL query that will de-identify a designated table. 
-        - This keeps the communication with bigquery to the absolute minimum, 
-        - Once the DEID query is built it is submitted to bigquery as a job that will handle parallelization and other optimizations.
-    
+    As a result of the nature of the de-identificatioin operations (chatty) and the limitations imposed by bigquery, we have implemented a query builder that will generate and build an SQL query that will implement the de-identification logic:
+    - This keeps the communication with bigquery to the minimum
+    - Once the DEID query is built it is submitted to bigquery as a job that can be monitored
+    BigQuery will handle the necessary optimizations
     e.g :
         If a table (relational) has a date-field and one or more arbitrary fields to be removed:
         1. A projection will be run against the list of fields that would work minus the date fields
@@ -35,8 +34,17 @@
         
     Once the Query is put together we send it to bigquery as a job that can be monitored
 
-    Usage
-@TODO: Add logging to have visibility into what the code is doing 
+    Usage :
+    Requirements:
+        You must install all the dependencies needed to run the code, they are found in the file requirements.txt.
+        The codebase is developed with python 2.7.x platform
+
+        pip install -r requirements.txt
+    python deid.py --i_datase <input_dataset> --table <table_name> --o_dataset <output_dataset>
+@TODO: 
+    - Add logging to have visibility into what the code is doing 
+    - Limitations append an existing table isn't yet supported
+    - Multi-race isn't yet supported
     
     
 """
@@ -255,18 +263,22 @@ class DropFields(Policy):
         self.remove = args['remove'] if 'remove' in args else []
     def can_do(self,dataset,table):
         name = dataset+"."+table
+        
         if name not in self.cache :
             try:
                 ref     = self.client.dataset(dataset).table(table)
                 schema  = self.client.get_table(ref).schema
-                # self.fields += [field.name for field in schema if field.field_type in ['DATE','TIMESTAMP','DATETIME']]
-                # self.fields = list(set(self.fields))    #-- removing duplicates from the list of fields
-                # p = len(self.fields) > 0  
-                self.remove += [field.name for field in schema if field.field_type in ['DATE','TIMESTAMP','DATETIME']]
-                self.remove = list(set(self.remove))    #-- removing duplicates from the list of fields
+                #
+                # we have here the opportunity to have both columns removed and rows removed
+                # The remove object has {columns:[],rows:[]} both of which should hold criteria for removal if true (simple logic)
+                #
+                remove_cols = self.remove['columns']
+                remove_cols += [field.name for field in schema if field.field_type in ['DATE','TIMESTAMP','DATETIME']]
+                remove_cols = list(set(remove_cols))    #-- removing duplicates from the list of fields
                 
-                p = len(self.remove) > 0       #-- Do we have fields to remove (for physical tables)
+                p = len(remove_cols) > 0       #-- Do we have fields to remove (for physical tables)
                 q = table in Policy.META_TABLES #-- Are we dealing with a meta table               
+                
                 self.cache[name] = p or q
                 sql = """
                     SELECT :fields
@@ -275,7 +287,7 @@ class DropFields(Policy):
                 
                 if p :
                     # _fields = [field.name for field in schema if field.name not in self.fields] #--fields that will be part of the projection
-                    _fields = [field.name for field in schema if field.name not in self.remove] 
+                    _fields = [field.name for field in schema if field.name not in remove_cols] 
                     lfields = list(_fields)
                     _fields = ",".join(_fields)
                 else:
@@ -309,7 +321,7 @@ class DropFields(Policy):
                             AND REGEXP_CONTAINS(concept_code,'(:filter)') IS FALSE
                         )
 
-                        
+                       
                     """.replace(":code",codes).replace(":vocabulary_id",self.vocabulary_id).replace(":filter",sql_filter)
                     #
                     #   We are now having to generalize rows that were filtered out (done in a loop)
@@ -343,6 +355,7 @@ class DropFields(Policy):
           
             except Exception,e:
                 print e
+        
         return self.cache [name]
     def get(self,dataset,table):
         name = dataset+"."+table
@@ -717,11 +730,11 @@ if __name__ == '__main__' :
     #   - google cloud client
     #   - Initialize class level parameters
     #
-    CONSTANTS = SYS_ARGS['constants']
+    CONSTANTS = SYS_ARGS['config']['constants']
     account_path = CONSTANTS['service-account-path']    
     Policy.TERMS.SEXUAL_ORIENTATION_NOT_STRAIGHT= CONSTANTS['sexual-orientation']['not-straight']
     Policy.TERMS.SEXUAL_ORIENTATION_STRAIGHT    = CONSTANTS['sexual-orientation']['straight']
-    Policy.TERMS.OBSERVATION_FILTERS            = CONSTANTS['observation-filters']
+    Policy.TERMS.OBSERVATION_FILTERS            = CONSTANTS['observation-filter']
     client = bq.Client.from_service_account_json(account_path)
 
     #
@@ -729,7 +742,7 @@ if __name__ == '__main__' :
     i_dataset   = SYS_ARGS['i_dataset']
     table       = SYS_ARGS['table']    
     o_dataset   = SYS_ARGS['o_dataset']
-    remove      = SYS_ARGS['suppression'][table] if table in SYS_ARGS['suppression'] else []
+    remove      = SYS_ARGS['config']['suppression'][table] if table in SYS_ARGS['config']['suppression'] else []
     #
     # The operation will be performed via the implementation of a form of iterator-design pattern
     # design information here https://en.wikipedia.org/wiki/Iterator_pattern
@@ -737,7 +750,7 @@ if __name__ == '__main__' :
     #
     # @TODO: perhaps vocabulary_id and constant_class_id can be removed
     #
-    args = {"client":client,"vocabulary_id"='PPI',"concept_class_id"=['Question','PPI Modifier'],"dataset"=i_dataset,table=table,"remove"=remove}
+    args = {"client":client,"vocabulary_id":'PPI',"concept_class_id":['Question','PPI Modifier'],"dataset":i_dataset,table:table,"remove":remove}
     container = [Shift(**args),DropFields(**args)]
     #
     # Let's see what we can do with the designated table, given our container of operations
@@ -747,9 +760,13 @@ if __name__ == '__main__' :
     r       = {}
     for item in container :
         name    = item.name()
-        p       =  item.can_do(self.dataset,self.table)          
+        #
+        # @Log: We are logging here the operaton that is expected to take place
+        # {"action":"building-sql","input":fields,"subject":table,"object":""}        
+        
+        p       =  item.can_do(i_dataset,table)          
         if p :
-            r[name] = item.get(self.dataset,self.table)
+            r[name] = item.get(i_dataset,table)
         else:
             continue
     #
@@ -805,13 +822,35 @@ if __name__ == '__main__' :
     #
     # At this point we should submit the sql query with information about the target
     #
+    FILTER = [ ]
     fields = ",".join(fields) + join_fields 
+
+    if 'rows' in remove :
+        #
+        # The user has specified rows to be removed from the final results
+        # In other words the fields that are not to be included
+        FILTER = ["WHERE"]
+        #
+        # @Log: We are logging here the operaton that is expected to take place
+        # {"action":"submit-sql","input":remove['rows'].keys(),"subject":table,"object":"bq"}        
+        for field in remove['rows'] :
+            filter = "".join(["REGEXP_CONTAINS(",field,",'",values,"'"])
+            if len(FILTER) > 0 :
+                filter = (" AND " + filter)
+            FILTER.append(filter)
+    
     if 'filter' in SYS_ARGS :
         #
         # @Log: We are logging here the operaton that is expected to take place
         # {"action":"building-sql","input":fields,"subject":table,"object":"filter"}
-        
-        sql = "SELECT * FROM ("+sql+") WHERE "+SYS_ARGS['filter']
+        if 'WHERE' not in FILTER :
+            FILTER += ["WHERE"]
+        FILTER += [SYS_ARGS['filter']]
+    #
+    #
+    FILTER = " ".join(FILTER)
+    print FILTER
+    sql = "SELECT * FROM ("+sql+") "+FILTER
     #
     # @Log: We are logging here the operaton that is expected to take place
     # {"action":"submit-sql","input":fields,"subject":table,"object":"bq"}      
@@ -822,9 +861,10 @@ if __name__ == '__main__' :
     job = bq.QueryJobConfig()
     job.destination = client.dataset(o_dataset).table(table)
     r = client.query(sql,location='US',job_config=job)
+
     #
     # @Log: We are logging here the operaton that is expected to take place
     # {"action":"submit-sql","input":job.job_id,"subject":table,"object":{"status":job.state,"running""job.running}}     
-        
+    print r.job_id,r.state,r.running() 
     #@TODO: monitor jobs once submitted
     pass
