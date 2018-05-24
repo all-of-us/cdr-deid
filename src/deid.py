@@ -859,7 +859,20 @@ if __name__ == '__main__' :
             FILTER += ["AND"]
         FILTER += [SYS_ARGS['filter']]
     #
+    # This is not ideal but we have to remove a portion of the population given their age
+    # For now we hard code this instruction and set the age as a parameter
+    # @TODO: ... urgh!!
     #
+
+    if 'exclude-age' in CONSTANTS :
+        EXCLUDE_AGE_SQL = "person_id not in (SELECT person_id FROM raw.observation where observation_source_value = 'PIIBirthInformation_BirthDate' and DATE_DIFF(CURRENT_DATE, CAST(value_as_string AS DATE),YEAR) > :age)"
+        EXCLUDE_AGE_SQL = EXCLUDE_AGE_SQL.replace(":age",str(CONSTANTS['exclude-age']))
+        if 'rows' in remove or 'filter' in SYS_ARGS :
+            EXCLUDE_AGE_SQL = ['AND', EXCLUDE_AGE_SQL]
+        else:
+            EXCLUDE_AGE_SQL = ['WHERE', EXCLUDE_AGE_SQL]
+
+        FILTER += EXCLUDE_AGE_SQL
     FILTER = " ".join(FILTER)
     
     sql = "SELECT * FROM ("+sql+") "+FILTER
