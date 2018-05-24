@@ -425,7 +425,9 @@ class Group(Policy):
         #
 
         # @TODO: Multiple races (add this)
-        
+        # sql = "SELECT person_id,count(*) FROM raw.observation WHERE observation_source_concept_id in (SELECT concept_id FROM raw.concept WHERE REGEXP_CONTAINS(concept_code,'^Race_')) GROUP BY person_id HAVING count(*) > 1"
+        # r = self.client.query(sql).to_dataframe()
+        # m_ids = ",".join([str(value) for value in r['person_id'].tolist()])
         #
         # We retrieve the identifiers of all the known races {black,white,asian,other} and anything that doesn't belong will be other
         # @NOTE:
@@ -460,10 +462,13 @@ class Group(Policy):
             #
             # Let's generalize race and everything that goes with
             # @TODO: Figure out cases for multiple races
-            p['value_as_string'] = "IF(value_source_concept_id not in (:_ids),':other_name',value_as_string) as value_as_string".replace(":_ids",_ids).replace(":other_name",other_name)
-            p['observation_source_concept_id'] = "IF(value_source_concept_id not in (:_ids),:other_id,observation_source_concept_id) as observation_source_concept_id".replace(":_ids",_ids).replace(":other_id",other_id)
-            p['observation_source_value'] = "IF(value_source_concept_id not in (:_ids), ':other_name',observation_source_value) as observation_source_value".replace(":_ids",_ids).replace(":other_name",other_name)
-            p['value_source_value'] = "IF(value_source_concept_id not in (:_ids), ':other_name',value_source_value) as value_source_value".replace(":_ids",_ids).replace(":other_name",other_name)
+            mr_sql="SELECT person_id from (SELECT COUNT(*), person_id FROM :dataset.:table WHERE observation_source_value like 'Race_%' GROUP BY person_id HAVING COUNT(*) > 1)".replace(":dataset",self.dataset).replace(":table",self.table)
+            p['value_as_string'] = "IF( person_id in (:mr_sql),'Multi-Racial',IF(value_source_concept_id not in (:_ids),':other_name',value_as_string)) as value_as_string".replace(":_ids",_ids).replace(":other_name",other_name).replace(":mr_sql",mr_sql)
+            p['observation_source_concept_id'] = "IF(person_id in (:mr_sql),2000000,IF(value_source_concept_id not in (:_ids),:other_id,observation_source_concept_id)) as observation_source_concept_id".replace(":_ids",_ids).replace(":other_id",other_id).replace(":mr_sql",mr_sql)
+            # p['observation_source_value'] = "IF((SELECT COUNT(*) FROM :dataset.observation z WHERE z.observation_source_value like 'Race_%' AND z.person_id = person_id) > 1,:other_name,IF(value_source_concept_id not in (:_ids), ':other_name',observation_source_value)) as observation_source_value".replace(":_ids",_ids).replace(":other_name",other_name).replace(":dataset",self.dataset)
+            # p['value_source_concept_id'] = "IF(value_source_concept_id not in (:_ids), ':other_id',value_source_concept_id) as value_source_concept_id".replace(":_ids",_ids).replace(":other_name",other_name).replace(":dataset",self.dataset)
+            p['value_source_concept_id'] = "IF(person_id in (:mr_sql),2000000,IF(value_source_concept_id not in (:_ids),:other_id,value_source_concept_id)) as value_source_concept_id".replace(":_ids",_ids).replace(":other_id",other_id).replace(":mr_sql",mr_sql)
+            p['value_source_value'] = "IF(person_id in (:mr_sql),'Multi-Racial',IF(value_source_concept_id not in (:_ids), ':other_name',value_source_value)) as value_source_value".replace(":_ids",_ids).replace(":other_name",other_name).replace(":mr_sql",mr_sql)
 
            
         return self.get_fields(p)
@@ -834,8 +839,13 @@ if __name__ == '__main__' :
         # @Log: We are logging here the operaton that is expected to take place
         # {"action":"submit-sql","input":remove['rows'].keys(),"subject":table,"object":"bq"}        
         for field in remove['rows'] :
-            filter = "".join(["REGEXP_CONTAINS(",field,",'",values,"'"])
-            if len(FILTER) > 0 :
+            #
+            # @NOTE:
+            # This particular filter is to express rows to be removed from the resultset
+            #
+            values = "|".join(remove['rows'][field])
+            filter = "".join(["REGEXP_CONTAINS(",field,",'",values,"') IS FALSE"])
+            if len(FILTER) > 1 :
                 filter = (" AND " + filter)
             FILTER.append(filter)
     
@@ -844,13 +854,16 @@ if __name__ == '__main__' :
         # @Log: We are logging here the operaton that is expected to take place
         # {"action":"building-sql","input":fields,"subject":table,"object":"filter"}
         if 'WHERE' not in FILTER :
-            FILTER += ["WHERE"]
+            FILTER += ["WHERE"]            
+        else:
+            FILTER += ["AND"]
         FILTER += [SYS_ARGS['filter']]
     #
     #
     FILTER = " ".join(FILTER)
-    print FILTER
+    
     sql = "SELECT * FROM ("+sql+") "+FILTER
+    
     #
     # @Log: We are logging here the operaton that is expected to take place
     # {"action":"submit-sql","input":fields,"subject":table,"object":"bq"}      
@@ -865,6 +878,7 @@ if __name__ == '__main__' :
     #
     # @Log: We are logging here the operaton that is expected to take place
     # {"action":"submit-sql","input":job.job_id,"subject":table,"object":{"status":job.state,"running""job.running}}     
-    print r.job_id,r.state,r.running() 
+    print r.job_id,r.state,r.running() ,r.errors
+    # print dir(r)
     #@TODO: monitor jobs once submitted
     pass
