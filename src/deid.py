@@ -272,14 +272,14 @@ class DropFields(Policy):
                 # we have here the opportunity to have both columns removed and rows removed
                 # The remove object has {columns:[],rows:[]} both of which should hold criteria for removal if true (simple logic)
                 #
-                remove_cols = self.remove['columns']
+                remove_cols = self.remove['columns'] if 'columns' in self.remove else []
                 remove_cols += [field.name for field in schema if field.field_type in ['DATE','TIMESTAMP','DATETIME']]
                 remove_cols = list(set(remove_cols))    #-- removing duplicates from the list of fields
                 
                 p = len(remove_cols) > 0       #-- Do we have fields to remove (for physical tables)
                 q = table in Policy.META_TABLES #-- Are we dealing with a meta table               
-                
-                self.cache[name] = p or q
+
+                self.cache[name] = p or q                
                 sql = """
                     SELECT :fields
                     FROM :i_dataset.:table
