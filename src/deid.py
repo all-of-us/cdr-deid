@@ -865,8 +865,8 @@ if __name__ == '__main__' :
     #
 
     if 'exclude-age' in CONSTANTS :
-        EXCLUDE_AGE_SQL = "person_id not in (SELECT person_id FROM raw.observation where observation_source_value = 'PIIBirthInformation_BirthDate' and DATE_DIFF(CURRENT_DATE, CAST(value_as_string AS DATE),YEAR) > :age)"
-        EXCLUDE_AGE_SQL = EXCLUDE_AGE_SQL.replace(":age",str(CONSTANTS['exclude-age']))
+        EXCLUDE_AGE_SQL = "person_id not in (SELECT person_id FROM :i_dataset.observation where observation_source_value = 'PIIBirthInformation_BirthDate' and DATE_DIFF(CURRENT_DATE, CAST(value_as_string AS DATE),YEAR) > :age)"
+        EXCLUDE_AGE_SQL = EXCLUDE_AGE_SQL.replace(":age",str(CONSTANTS['exclude-age'])).replace(":i_dataset",i_dataset)
         if 'rows' in remove or 'filter' in SYS_ARGS :
             EXCLUDE_AGE_SQL = ['AND', EXCLUDE_AGE_SQL]
         else:
