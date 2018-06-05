@@ -223,29 +223,46 @@ class Shift (Policy):
                     # I assume the only meta-table is the observation table in the case of another one more parameters need to be passed
                     #
                     union_fields = ['value_as_string']+joined_fields +['person_id']
-                
+                    #
+                    # @NOTE: The date-shifting here is redundant, but it's an artifact of mixing relational & meta-model in the database
+                    #
+                    begin_of_time = datetime.strptime(Policy.TERMS.BEGIN_OF_TIME,'%Y-%m-%d')
+                    year = int(datetime.now().strftime("%Y"))  - begin_of_time.year
+                    month = begin_of_time.month
+                    day = begin_of_time.day
+                    shifted_date = """CAST(DATE_SUB( DATE_SUB(DATE_SUB( CAST(:name AS DATE),INTERVAL :year YEAR),INTERVAL :month MONTH),INTERVAL :day DAY) AS STRING) as :name""".replace(':name',"value_as_string").replace(":year",str(year)).replace(":month",str(month)).replace(":day",str(day))
+                    
                     #--AND person_id = 562270
+                    sql_filter = "|".join(Policy.TERMS.OBSERVATION_FILTERS.values())
                     _sql = """
+                    SELECT :shifted_date,person_id, :shifted_fields :fields
+                    FROM :i_dataset.observation x where observation_source_value in (
+                        SELECT concept_code from :i_dataset.concept WHERE REGEXP_CONTAINS(concept_code,'Date|DATE|date') IS TRUE
+                        AND REGEXP_CONTAINS(concept_code,'(:filter)') IS FALSE
+                    )
+                    """.replace(":i_dataset",dataset).replace(":shifted_fields",",".join(sql_fields)).replace(":shifted_date",shifted_date).replace(":filter",sql_filter)
+                    # print _sql
+                    # _sql = """
                     
-                        SELECT CAST (DATE_DIFF(CAST(x.value_as_string AS DATE),CAST(y.value_as_string AS DATE),DAY) as STRING) as value_as_string, x.person_id, :shifted_fields :fields
-                        FROM :i_dataset.observation x INNER JOIN (
-                            SELECT MAX(value_as_string) as value_as_string, person_id
-                            FROM :i_dataset.observation
-                            WHERE observation_source_value = 'ExtraConsent_TodaysDate'
+                    #     SELECT CAST (DATE_DIFF(CAST(x.value_as_string AS DATE),CAST(y.value_as_string AS DATE),DAY) as STRING) as value_as_string, x.person_id, :shifted_fields :fields
+                    #     FROM :i_dataset.observation x INNER JOIN (
+                    #         SELECT MAX(value_as_string) as value_as_string, person_id
+                    #         FROM :i_dataset.observation
+                    #         WHERE observation_source_value = 'ExtraConsent_TodaysDate'
                             
-                            GROUP BY person_id
-                        ) y ON x.person_id = y.person_id 
+                    #         GROUP BY person_id
+                    #     ) y ON x.person_id = y.person_id 
                         
-                        WHERE observation_source_value in (
+                    #     WHERE observation_source_value in (
                             
-                            SELECT concept_code from :i_dataset.concept 
-                            WHERE REGEXP_CONTAINS(concept_code,'(DATE|Date|date)') IS TRUE
+                    #         SELECT concept_code from :i_dataset.concept 
+                    #         WHERE REGEXP_CONTAINS(concept_code,'(DATE|Date|date)') IS TRUE
                             
-                        )
+                    #     )
                          
-                    """.replace(":i_dataset",dataset).replace(":shifted_fields",",".join(sql_fields))
+                    # """.replace(":i_dataset",dataset).replace(":shifted_fields",",".join(sql_fields))
                     
-                    self.policies[name]["union"] = {"sql":_sql.replace('__targetTable.',''),"fields":union_fields,"shifted_values":sql_fields}
+                    self.policies[name]["union"] = {"sql":_sql,"fields":union_fields,"shifted_values":sql_fields}
                     
                     # self.policies[name]['meta'] = 'foo'
                 #
