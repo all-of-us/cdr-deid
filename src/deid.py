@@ -51,7 +51,10 @@
 from __future__ import division
 import sys
 import json
+import logging
 from google.cloud import bigquery as bq
+from datetime import datetime
+import os
 
 #
 # Let's process the arguments passed in via the command-line
@@ -66,13 +69,34 @@ if len(sys.argv) > 1:
 		if sys.argv[i].startswith('--'):
 			key = sys.argv[i].replace('-','')
 			SYS_ARGS[key] = 1
-			if i + 1 < N:
+			if i + 1 < N and sys.argv[i+1].startswith('--') is False:
 				value = sys.argv[i + 1] = sys.argv[i+1].strip()
 			if key and value:
 				SYS_ARGS[key] = value
 		
 		i += 2
-
+class Logging:
+    """
+        This class will perform a basic logging against a file, 
+        if no --log is specified in the SYS_ARGS then the log function will just print
+        @TODO: 
+        Logging for other areas endpoint, database, ...
+    """
+    @staticmethod
+    def log(**args):
+        name = datetime.now().strftime('deid-%Y-%m-%d.log')
+        
+        date = json.loads(datetime.now().strftime('{"year":%Y,"month":"%m","day":"%d","hour":"%H","min":"%M"}'))
+        row = json.dumps(dict(date,**args))
+        row = json.dumps(args)
+        if 'log' in SYS_ARGS  :
+            path = './' if SYS_ARGS['log'] == 1 else SYS_ARGS['log']
+            filename = os.sep.join([path,name])
+            logging.basicConfig(filename=filename,level=logging.INFO,format='%(message)s')            
+            logging.info(row)
+        else:
+            print (row)
+        
 class Policy :
     """
         This function will apply Policies given the fields found on a given table
@@ -83,8 +107,19 @@ class Policy :
         SEXUAL_ORIENTATION_STRAIGHT     = 'SexualOrientation_Straight'
         SEXUAL_ORIENTATION_NOT_STRAIGHT = 'SexualOrientation_None'
         OBSERVATION_FILTERS = {"race":'Race_WhatRace',"gender":'Gender',"orientation":'Orientation',"employment":'_EmploymentStatus',"sex_at_birth":'BiologicalSexAtBirth_SexAtBirth',"language":'Language_SpokenWrittenLanguage',"education":'EducationLevel_HighestGrade'}
+        BEGIN_OF_TIME = '1980-07-21'
 
-    
+    @staticmethod
+    def get_dropped_fields(fields):
+        """ 
+            In order to preserve structural integrity of the database we must empty the values of the fields systematically
+            @NOTE:
+        """
+        r = []
+        for name in fields :
+            r.append("""'' as :name """.replace(":name",name))
+        
+        return r
     def __init__(self,**args):
         """
             This function loads basic specifications for a policy
@@ -100,6 +135,7 @@ class Policy :
         self.concept_class_id = args['concept_class_id'] if 'concept_class_id' in args else ['Question','PPI Modifier']
         if isinstance(self.concept_class_id,str):
             self.concept_class_id = self.concept_class_id.split(",")            
+        Logging.log(subject=self.name(),action='init',object=self.client.project,value=[])
 
     def can_do(self,id,meta):
         return False
@@ -154,28 +190,29 @@ class Shift (Policy):
                 if self.cache[name] == True :
                     #
                     # At this point we have to perform a join on relational date fields, the dates are determined by the date at which a given candidate signed up
-                    #
-                    sql = """
-                        SELECT x.person_id,:fields 
-                        FROM :i_dataset.observation x INNER JOIN 
-                            :i_dataset.:table __targetTable
+                    # @TODO: Remove the SQL in this context no need it create an unnecessary bottleneck
+                    # sql = """
+                    #     SELECT x.person_id,:fields 
+                    #     FROM :i_dataset.observation x INNER JOIN 
+                    #         :i_dataset.:table __targetTable
 
-                        ON __targetTable.person_id = x.person_id 
-                        WHERE x.observation_source_value = 'ExtraConsent_TodaysDate'
-                        :additional_condition
+                    #     ON __targetTable.person_id = x.person_id 
+                    #     WHERE x.observation_source_value = 'ExtraConsent_TodaysDate'
+                    #     :additional_condition
                         
-                    """.replace(":fields",sql_fields).replace(":i_dataset",dataset).replace(":table",table)
+                    # """.replace(":fields",sql_fields).replace(":i_dataset",dataset).replace(":table",table)
                     #
                     # @NOTE: If the working table is observation we should add an additional condition in the filter
                     # This would improve the joins performance
                     # @TODO: Find a way to re-write the query (simpler is better) and remove the condition below
                     #
                     
-                    if table == 'observation' :
-                        sql = sql.replace(":additional_condition"," AND x.observation_id = __targetTable.observation_id")
-                    else:
-                        sql = sql.replace(":additional_condition","")                    
-                    self.policies[name] = {"join":{"sql":sql,"fields":joined_fields}}
+                    # if table == 'observation' :
+                    #     sql = sql.replace(":additional_condition"," AND x.observation_id = __targetTable.observation_id")
+                    # else:
+                    #     sql = sql.replace(":additional_condition","")                    
+                    # self.policies[name] = {"join":{"sql":sql,"fields":joined_fields}}
+                    self.policies[name] = {"join":{"sql":None,"fields":joined_fields,"shifted_values":sql_fields}}
 
                 if q :
                    
@@ -206,33 +243,41 @@ class Shift (Policy):
                             
                         )
                          
-                    """.replace(":i_dataset",dataset).replace(":shifted_fields",sql_fields)
+                    """.replace(":i_dataset",dataset).replace(":shifted_fields",",".join(sql_fields))
                     
-                    self.policies[name]["union"] = {"sql":_sql.replace('__targetTable.',''),"fields":union_fields}
+                    self.policies[name]["union"] = {"sql":_sql.replace('__targetTable.',''),"fields":union_fields,"shifted_values":sql_fields}
                     
                     # self.policies[name]['meta'] = 'foo'
                 #
                 # @TODO: Log the results of the propositional logic operation (summarized)
-                
+                Logging.log(subject=self.name(),object=name,action='can_do',value={"relational":p,"meta":q})
             except Exception, e:
                 # @TODO
                 # We need to log this stuff ...
                 print e
+                Logging.log(subject=self.name(),object=name,action='error.can_do',value=e.message)
         
         return self.cache[name]
     def __get_shifted_fields(self,fields):
         """
             @param fields   a list of SchemaField objects
         """
+        begin_of_time = datetime.strptime(Policy.TERMS.BEGIN_OF_TIME,'%Y-%m-%d')
+        year = int(datetime.now().strftime("%Y"))  - begin_of_time.year
+        month = begin_of_time.month
+        day = begin_of_time.day
         r = []
         for field in fields :
-            shifted_field =  """
-                DATE_DIFF( CAST(x.value_as_string AS DATE), CAST(__targetTable.:name AS DATE), DAY) as :name
-            """.replace(':name',field.name)
+            # shifted_field =  """
+            #     DATE_DIFF( CAST(:name AS DATE), CAST(':date' AS DATE), DAY) as :name
+            # """.replace(':name',field.name).replace(":date",Policy.TERMS.BEGIN_OF_TIME)
+            shifted_field = """
+                DATE_SUB( DATE_SUB(DATE_SUB( CAST(:name AS DATE),INTERVAL :year YEAR),INTERVAL :month MONTH),INTERVAL :day DAY) as :name
+            """.replace(':name',field.name).replace(":year",str(year)).replace(":month",str(month)).replace(":day",str(day))
             
             r.append(shifted_field)
-           
-        return ",".join(r)
+        Logging.log(subject=self.name(),action='shifting.dates',object=[field.name for field in fields],value=Policy.TERMS.BEGIN_OF_TIME)   
+        return r #",".join(r)
     def get(self,dataset,table):
         """
         @pre:
@@ -261,6 +306,7 @@ class DropFields(Policy):
         Policy.__init__(self,**args)
         # self.fields = args['fields'] if 'fields' in args else []
         self.remove = args['remove'] if 'remove' in args else []
+        
     def can_do(self,dataset,table):
         name = dataset+"."+table
         
@@ -268,20 +314,22 @@ class DropFields(Policy):
             try:
                 ref     = self.client.dataset(dataset).table(table)
                 schema  = self.client.get_table(ref).schema
+                gsql    = None
                 #
                 # we have here the opportunity to have both columns removed and rows removed
                 # The remove object has {columns:[],rows:[]} both of which should hold criteria for removal if true (simple logic)
                 #
+                
                 remove_cols = self.remove['columns'] if 'columns' in self.remove else []
-                remove_cols += [field.name for field in schema if field.field_type in ['DATE','TIMESTAMP','DATETIME']]
-                remove_cols = list(set(remove_cols))    #-- removing duplicates from the list of fields
+                date_cols = [field.name for field in schema if field.field_type in ['DATE','TIMESTAMP','DATETIME']]
+                remove_cols = list(set(remove_cols) | set(date_cols))    #-- removing duplicates from the list of fields
                 
                 p = len(remove_cols) > 0       #-- Do we have fields to remove (for physical tables)
                 q = table in Policy.META_TABLES #-- Are we dealing with a meta table               
 
                 self.cache[name] = p or q                
                 sql = """
-                    SELECT :fields
+                    SELECT :fields :shifted_date_columns
                     FROM :i_dataset.:table
                 """
                 
@@ -296,7 +344,7 @@ class DropFields(Policy):
                 #
                 # @Log: We are logging here the operaton that is expected to take place
                 # {"action":"drop-fields","input":self.remove,"subject":table,"object":"columns"}
-                
+                Logging.log(subject=self.name(),object=name,action='can_do',value={"drop.cols":remove_cols,"shift.cols":date_cols})
                 if q :
                     #
                     # We are dealing with observation / meta table. Certain rows have to be removed due to the fact that it's a meta-table
@@ -338,18 +386,23 @@ class DropFields(Policy):
                         if len(r.keys()) > 0 :
                             ofields = [ r[fname] if fname in r else fname for fname in lfields]
                             
-                            _sql_ = "SELECT :fields FROM :i_dataset.:table WHERE observation_source_concept_id in (SELECT concept_id FROM :i_dataset.concept WHERE REGEXP_CONTAINS(concept_code,'(?i):key')) "
+                            _sql_ = "SELECT :fields  :shifted_date_columns FROM :i_dataset.:table WHERE observation_source_concept_id in (SELECT concept_id FROM :i_dataset.concept WHERE REGEXP_CONTAINS(concept_code,'(?i):key')) "
                             _sql_ = _sql_.replace(":fields",",".join(ofields)).replace(":table",table).replace(":key",key).replace(":i_dataset",dataset)
                             
                             xsql.append( " UNION ALL "+_sql_ )
                             
-                            
-                    sql =  " SELECT :fields from (" +" ".join(xsql) +") GROUP BY :fields"
+                    # if len(xsql) > 0 :
+                    #     gsql = "SELECT :fields from ("+ " ".join(xsql)+")".replace(":i_dataset",dataset).replace(":table",table).replace(":fields",_fields)
+                    # else:
+                    #     gsql = None
+                    sql =  " SELECT :fields :shifted_date_columns from (" +" ".join(xsql) +")"
                 sql = sql.replace(":fields",_fields).replace(":i_dataset",dataset).replace(":table",table)
                 
                 
                     
                 self.policies[name] = {"sql":sql,"fields":lfields}
+                # if gsql is not None:
+                #     self.policies[name]['generalized'] = gsql
                
                 
           
@@ -614,113 +667,9 @@ class Group(Policy):
         
         return self.__get_formatted_observations(_ids,other_name,other_id)
         
-class Orchestrator():
-    """
-        This class is designed to run deidentification against an OMOP table/database provided configuration
-        @param dataset
-        @param table
-        @param vocabulary_id
-        @param concept_class_id
-    """
-    def __init__(self,**args):
-        self.actors  = [Shift(**args),DropFields(**args)] #,Group(**args)]
-        self.dataset = args['dataset'] 
-        self.table   = args['table']
-        self.sql     = None
-        # self.parent_fields = args['parent_fields'] if 'parent_fields' in args else None
-        self.setup()
-    def setup(self):
-        """
-            This function will setup the order of execution of deidentification operations/actors
-            For example
-        """
-        r       = {}
-        for item in self.actors :
-            name    = item.name()
-            p       =  item.can_do(self.dataset,self.table)          
-            if p :
-                r[name] = item.get(self.dataset,self.table)
-            else:
-                continue
-       
-        if 'dropfields' in r :
-        #     print r['dropfields']['rel']
-            fields =  r['dropfields']['fields']
-
-            sql = "SELECT :parent_fields FROM ("+r['dropfields']['sql']+") a"
-            # sql = sql.replace(":fields",top_prefixed_fields)
-            # sql = sql.replace(":fields",",".join(fields))
-            if 'shift' in r :
-                if 'join' in r['shift'] :                    
-                    # ",".join(["a."+field for field in fields])
-                    #
-                    # considering a cartesian product is performed, this will change the number of fields of the final output
-                    # We therefore need to prefix the parts of the query appropriately
-
-                    #
-                    #
-                    
-                    
-                    part_a_prefix = ['a.'+name for name in fields if name not in r['shift']['join']['fields']]
-                    
-                    part_a_prefix += r['shift']['join']['fields']
-                    
-                    top_prefixed_fields = ",".join(part_a_prefix)
-                    sql = sql.replace(":parent_fields",top_prefixed_fields)
-                    join_sql = r['shift']['join']['sql']
-                    join_fields = ",".join(['']+r['shift']['join']['fields']) #-- should start with comma
-                    sql = sql + " INNER JOIN (:sql) p ON p.person_id = a.person_id ".replace(":sql",join_sql)
-                    #
-                    # If we are dealing with observations we should tie down this record
-                    #
-                    # if 'observation_id' in fields :
-                    #     sql += " "
-
-                else:
-                    join_fields = ""    
-                sql = sql.replace(":joined_fields",join_fields)
-                fields = [field.replace('a.','') for field in fields]
-                if 'union' in r['shift']:
-                    #
-                    # we perform a union operation on this table in order to add meta data table information to the original projection
-                    union_sql = r['shift']['union']['sql']
-                    non_union_fields = list(set(fields) - set(r['shift']['union']['fields']))
-                    non_union_fields = ",".join([' ']+non_union_fields)
-                    union_sql = union_sql.replace(":fields",non_union_fields)
-                    sql = sql + " UNION ALL SELECT :fields :joined_fields FROM ( :sql ) ".replace(":sql",union_sql)    
-                    
-                    sql = sql.replace(":fields",",".join(fields)).replace(":joined_fields",join_fields)
-                    pass
-                pass
-            #
-            # at this point we create a view that will serve as a basis for the shifting
-            #   
-            #
-            self.sql = sql #"".join(["CREATE VIEW out.:table AS (",sql,")"])
-            self.fields = list(set(fields + join_fields.split(",") ) - set(['']))
-            # args = {}
-            # args['client']  = client
-            # args['sql']     = _sql
-            # args['dataset'] = self.dataset
-            # args['table']   = self.table
-            # Group(**args)
-    def generalize(self,**args):
-        pass
-            # print _sql #.replace(":fields",fields)
-        # if 'dropfields' in r :
-        #     fields = ",".join(r['dropfields']['fields'])
-        #     sql = "SELECT :fields FROM (:sql)".replace(":sql",r['dropfields']['sql']).replace(":fields", fields)
-        #     if 'shift' in r :
-              
-        #         sql = " SELECT * FROM (:sql) a ".replace(":sql",r['shift']['rel'])
-        #         if 'meta' in r['shift'] :
-        #             sql = sql + " INNER JOIN (:sql) b ON a.person_id = b.person_id".replace(":sql",r['shift']['rel'])
-        #         # sql = sql + " UNION (:sql)".replace(":sql",r['shift']['meta'])
-            # print sql.replace(":fields",fields)
-
 
 #
-# 
+# The code below will implement the orchestration and parameter handling from the command line 
 #             
 if __name__ == '__main__' :
     #
@@ -740,6 +689,7 @@ if __name__ == '__main__' :
     Policy.TERMS.SEXUAL_ORIENTATION_NOT_STRAIGHT= CONSTANTS['sexual-orientation']['not-straight']
     Policy.TERMS.SEXUAL_ORIENTATION_STRAIGHT    = CONSTANTS['sexual-orientation']['straight']
     Policy.TERMS.OBSERVATION_FILTERS            = CONSTANTS['observation-filter']
+    Policy.TERMS.BEGIN_OF_TIME = '1980-07-21' if 'begin-of-time' not in CONSTANTS['begin-of-time'] else CONSTANTS['begin-of-time']
     client = bq.Client.from_service_account_json(account_path)
 
     #
@@ -769,7 +719,7 @@ if __name__ == '__main__' :
         # @Log: We are logging here the operaton that is expected to take place
         # {"action":"building-sql","input":fields,"subject":table,"object":""}        
         
-        p       =  item.can_do(i_dataset,table)          
+        p       =  item.can_do(i_dataset,table)               
         if p :
             r[name] = item.get(i_dataset,table)
         else:
@@ -792,23 +742,26 @@ if __name__ == '__main__' :
     
 
     if 'shift' in r :
+        
         if 'join' in r['shift'] :
             #
             # @Log: We are logging here the operaton that is expected to take place
             # {"action":"building-sql","input":fields,"subject":table,"object":"join"}
             prefixed_fields = ['a.'+name for name in fields if name not in r['shift']['join']['fields']]            
-            prefixed_fields += r['shift']['join']['fields']
+            prefixed_fields +=['a.'+name for name in r['shift']['join']['fields'] ]
             
             prefixed_fields = ",".join(prefixed_fields)
             
-            join_sql = r['shift']['join']['sql']
+            # join_sql = r['shift']['join']['sql']
             join_fields = ",".join(['']+r['shift']['join']['fields']) #-- should start with comma
-            sql = sql + " INNER JOIN (:sql) p ON p.person_id = a.person_id ".replace(":sql",join_sql)
+            # sql = sql + " INNER JOIN (:sql) p ON p.person_id = a.person_id ".replace(":sql",join_sql)
+            shifted_values = ","+ ",".join(r['shift']['join']['shifted_values'])
         else:
             prefixed_fields = ['a.'+name for name in fields if name not in fields ]
             join_fields = ""
+            shifted_values = ""
         
-        sql = sql.replace(":parent_fields",prefixed_fields)    
+        sql = sql.replace(":parent_fields",prefixed_fields).replace(":shifted_date_columns",shifted_values)
         
         if 'union' in r['shift'] :
             #
@@ -824,6 +777,7 @@ if __name__ == '__main__' :
             
         else:
             pass
+    sql = sql.replace(":shifted_date_columns",shifted_values)
     #
     # At this point we should submit the sql query with information about the target
     #
@@ -875,8 +829,19 @@ if __name__ == '__main__' :
         FILTER += EXCLUDE_AGE_SQL
     FILTER = " ".join(FILTER)
     
-    sql = "SELECT * FROM ("+sql+") "+FILTER
-    
+    sql = "SELECT * :dropped_fields FROM ("+sql+") "+FILTER
+    #
+    # Bug-fix:
+    #   Insuring the tables maintain their structural integrity
+    dropped_fields = Policy.get_dropped_fields(remove['columns']) if 'columns' in remove else []
+    if len(dropped_fields) > 0 :
+        dropped_fields = ","+",".join(dropped_fields)
+    else:
+        dropped_fields = ""
+    # print sql
+    Logging.log(subject='composer',object=table,action='formatted.removed.columns',value=remove['columns'])
+    sql = sql.replace(":dropped_fields",dropped_fields)
+      
     #
     # @Log: We are logging here the operaton that is expected to take place
     # {"action":"submit-sql","input":fields,"subject":table,"object":"bq"}      
@@ -886,12 +851,16 @@ if __name__ == '__main__' :
     #
     job = bq.QueryJobConfig()
     job.destination = client.dataset(o_dataset).table(table)
+    job.use_query_cache = True
+    job.allow_large_results = True
+    # job.dry_run = True    
     r = client.query(sql,location='US',job_config=job)
 
     #
     # @Log: We are logging here the operaton that is expected to take place
     # {"action":"submit-sql","input":job.job_id,"subject":table,"object":{"status":job.state,"running""job.running}}     
     print r.job_id,r.state,r.running() ,r.errors
+    Logging.log(subject="composer",object=r.job_id,action="submit.job",value={"from":i_dataset+"."+table,"to":o_dataset})
     # print dir(r)
     #@TODO: monitor jobs once submitted
     pass
