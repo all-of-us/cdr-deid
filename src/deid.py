@@ -41,10 +41,11 @@
 
         pip install -r requirements.txt
     python deid.py --i_datase <input_dataset> --table <table_name> --o_dataset <output_dataset>
+
 @TODO: 
-    - Add logging to have visibility into what the code is doing 
+    - Improve the logs (make sure they're expressive and usable for mining)
     - Limitations append an existing table isn't yet supported
-    - Multi-race isn't yet supported
+    
     
     
 """
