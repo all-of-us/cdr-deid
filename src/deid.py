@@ -182,36 +182,12 @@ class Shift (Policy):
                 fields = [field for field in info if field.field_type in ('DATE','TIMESTAMP','DATETIME')]
                 p = len(fields) > 0 #-- do we have physical fields as concepts
                 q = table in Policy.META_TABLES
-                sql_fields = self.__get_shifted_fields(fields)
+                sql_fields = self.__get_shifted_fields(fields,dataset,table)
                 #
                 # In the case we have something we should store it
                 self.cache[name] = p or q
                 joined_fields = [field.name for field in fields]
                 if self.cache[name] == True :
-                    #
-                    # At this point we have to perform a join on relational date fields, the dates are determined by the date at which a given candidate signed up
-                    # @TODO: Remove the SQL in this context no need it create an unnecessary bottleneck
-                    # sql = """
-                    #     SELECT x.person_id,:fields 
-                    #     FROM :i_dataset.observation x INNER JOIN 
-                    #         :i_dataset.:table __targetTable
-
-                    #     ON __targetTable.person_id = x.person_id 
-                    #     WHERE x.observation_source_value = 'ExtraConsent_TodaysDate'
-                    #     :additional_condition
-                        
-                    # """.replace(":fields",sql_fields).replace(":i_dataset",dataset).replace(":table",table)
-                    #
-                    # @NOTE: If the working table is observation we should add an additional condition in the filter
-                    # This would improve the joins performance
-                    # @TODO: Find a way to re-write the query (simpler is better) and remove the condition below
-                    #
-                    
-                    # if table == 'observation' :
-                    #     sql = sql.replace(":additional_condition"," AND x.observation_id = __targetTable.observation_id")
-                    # else:
-                    #     sql = sql.replace(":additional_condition","")                    
-                    # self.policies[name] = {"join":{"sql":sql,"fields":joined_fields}}
                     self.policies[name] = {"join":{"sql":None,"fields":joined_fields,"shifted_values":sql_fields}}
 
                 if q :
@@ -226,12 +202,20 @@ class Shift (Policy):
                     #
                     # @NOTE: The date-shifting here is redundant, but it's an artifact of mixing relational & meta-model in the database
                     #
-                    begin_of_time = datetime.strptime(Policy.TERMS.BEGIN_OF_TIME,'%Y-%m-%d')
-                    year = int(datetime.now().strftime("%Y"))  - begin_of_time.year
-                    month = begin_of_time.month
-                    day = begin_of_time.day
-                    shifted_date = """CAST(DATE_SUB( DATE_SUB(DATE_SUB( CAST(:name AS DATE),INTERVAL :year YEAR),INTERVAL :month MONTH),INTERVAL :day DAY) AS STRING) as :name""".replace(':name',"value_as_string").replace(":year",str(year)).replace(":month",str(month)).replace(":day",str(day))
+                    # begin_of_time = datetime.strptime(Policy.TERMS.BEGIN_OF_TIME,'%Y-%m-%d')
+                    # year = int(datetime.now().strftime("%Y"))  - begin_of_time.year
+                    # month = begin_of_time.month
+                    # day = begin_of_time.day
+                    # shifted_date = """CAST(DATE_SUB( DATE_SUB(DATE_SUB( CAST(:name AS DATE),INTERVAL :year YEAR),INTERVAL :month MONTH),INTERVAL :day DAY) AS STRING) as :name""".replace(':name',"value_as_string").replace(":year",str(year)).replace(":month",str(month)).replace(":day",str(day))
                     
+                    # shifted_field = """
+                    #     CAST(
+                    #     date_sub((SELECT CAST(value_as_string as DATE) FROM :i_dataset.observation ii where ii.person_id = person_id and observation_source_value='ExtraConsent_TodaysDate' limit 1) , INTERVAL 
+                    #     date_diff(:name, (SELECT seed from :i_dataset.people_seed ii where ii.person_id = person_id), DAY) DAY) AS STRING) as :name
+                    # """.replace(":name","value_as_string")
+                    shifted_date = """CAST( DATE_SUB( CAST(:name AS DATE), INTERVAL (SELECT seed from :i_dataset.people_seed xii WHERE xii.person_id = :table.person_id) DAY) AS STRING) as :name"""
+                    shifted_date = shifted_date.replace(":name","value_as_string").replace(":i_dataset",dataset).replace(":table","x")
+                    sql_fields = self.__get_shifted_fields(fields,dataset,"x")
                     #--AND person_id = 562270
                     sql_filter = "|".join(Policy.TERMS.OBSERVATION_FILTERS.values())
                     _sql = """
@@ -241,7 +225,7 @@ class Shift (Policy):
                         AND REGEXP_CONTAINS(concept_code,'(:filter)') IS FALSE
                     )
                     """.replace(":i_dataset",dataset).replace(":shifted_fields",",".join(sql_fields)).replace(":shifted_date",shifted_date).replace(":filter",sql_filter)
-                    # print _sql
+                    
                     # _sql = """
                     
                     #     SELECT CAST (DATE_DIFF(CAST(x.value_as_string AS DATE),CAST(y.value_as_string AS DATE),DAY) as STRING) as value_as_string, x.person_id, :shifted_fields :fields
@@ -275,25 +259,31 @@ class Shift (Policy):
                 Logging.log(subject=self.name(),object=name,action='error.can_do',value=e.message)
         
         return self.cache[name]
-    def __get_shifted_fields(self,fields):
+    def __get_shifted_fields(self,fields,dataset,table):
         """
+            This function should be used for relational fields only !!
             @param fields   a list of SchemaField objects
         """
-        begin_of_time = datetime.strptime(Policy.TERMS.BEGIN_OF_TIME,'%Y-%m-%d')
-        year = int(datetime.now().strftime("%Y"))  - begin_of_time.year
-        month = begin_of_time.month
-        day = begin_of_time.day
+        # begin_of_time = datetime.strptime(Policy.TERMS.BEGIN_OF_TIME,'%Y-%m-%d')
+        # year = int(datetime.now().strftime("%Y"))  - begin_of_time.year
+        # month = begin_of_time.month
+        # day = begin_of_time.day
         r = []
+        
         for field in fields :
             # shifted_field =  """
             #     DATE_DIFF( CAST(:name AS DATE), CAST(':date' AS DATE), DAY) as :name
             # """.replace(':name',field.name).replace(":date",Policy.TERMS.BEGIN_OF_TIME)
+            # shifted_field = """
+            #     DATE_SUB( DATE_SUB(DATE_SUB( CAST(:name AS DATE),INTERVAL :year YEAR),INTERVAL :month MONTH),INTERVAL :day DAY) as :name
+            # """.replace(':name',field.name).replace(":year",str(year)).replace(":month",str(month)).replace(":day",str(day))
+           
             shifted_field = """
-                DATE_SUB( DATE_SUB(DATE_SUB( CAST(:name AS DATE),INTERVAL :year YEAR),INTERVAL :month MONTH),INTERVAL :day DAY) as :name
-            """.replace(':name',field.name).replace(":year",str(year)).replace(":month",str(month)).replace(":day",str(day))
-            
+               DATE_SUB( CAST(:name AS DATE), INTERVAL (SELECT seed from :i_dataset.people_seed xii WHERE xii.person_id = :table.person_id) DAY) as :name
+            """.replace(":name",field.name).replace(":table",table).replace(":i_dataset",dataset)
+            # shifted_field = shifted_field.replace(":name",field.name).replace(":i_dataset",dataset)
             r.append(shifted_field)
-        Logging.log(subject=self.name(),action='shifting.dates',object=[field.name for field in fields],value=Policy.TERMS.BEGIN_OF_TIME)   
+        Logging.log(subject=self.name(),action='shifting.dates',object=[field.name for field in fields],value=[field.name for field in fields])   
         return r #",".join(r)
     def get(self,dataset,table):
         """
@@ -407,12 +397,13 @@ class DropFields(Policy):
                             _sql_ = _sql_.replace(":fields",",".join(ofields)).replace(":table",table).replace(":key",key).replace(":i_dataset",dataset)
                             
                             xsql.append( " UNION ALL "+_sql_ )
-                            
-                    # if len(xsql) > 0 :
-                    #     gsql = "SELECT :fields from ("+ " ".join(xsql)+")".replace(":i_dataset",dataset).replace(":table",table).replace(":fields",_fields)
-                    # else:
-                    #     gsql = None
-                    sql =  " SELECT :fields :shifted_date_columns from (" +" ".join(xsql) +")"
+                    if len(date_cols) is None :
+                        date_cols = ""
+                    else:
+                        date_cols = ","+",".join(date_cols)    
+                    
+                    sql =  " SELECT :fields "+date_cols+" from (" +" ".join(xsql) +")"
+                    
                 sql = sql.replace(":fields",_fields).replace(":i_dataset",dataset).replace(":table",table)
                 
                 
@@ -683,7 +674,55 @@ class Group(Policy):
         _ids = [str(value) for value in r['concept_id'].tolist()]
         
         return self.__get_formatted_observations(_ids,other_name,other_id)
+def initialization(client,dataset):
+    """
+        This function will determine if the person_seed table needs to be destroyed and re-initialized
+        I decided to make this function dummy proof to make it more user friendly
+
+        :client     initialized big query client
+        :dataset    dataset name
+    """
+    
+    ref = client.dataset(dataset)
+    has_table = len([1 for table in client.list_tables(ref) if table.table_id == 'people_seed']) > 0
+    Logging.log(subject='composer',object='big.query',action='has.seed',value=(1*has_table))
+    
+    if has_table == True :
+        #
+        # The seeding table was found, we need to make sure the table has an acceptable level of consistency
+        #
+        # r_o = client.get_table(client.dataset(dataset).table("observation"))
+        r_i = client.get_table(client.dataset(dataset).table("people_seed"))        
+        sql="SELECT COUNT(DISTINCT person_id) as count FROM :i_dataset.observation ".replace(":i_dataset",dataset)
         
+        r = client.query(sql).to_dataframe()
+        Logging.log(subject="composer", object="make.seed",action="evaluate", value= r_i.num_rows/r['count'].values[0])
+        if  r_i.num_rows / r['count'].values[0] < .9 :
+            #
+            # we need to destroy the seeding table and alert the user of this
+            
+            #
+            
+            ref = client.dataset(dataset).table("people_seed")            
+            client.delete_table(ref)
+            Logging.log(subject='composer',object='big.query',action='drop.table',value=ref.to_api_repr)
+            has_table = True
+    #
+    # We create the table here if there was an error found
+    
+    if has_table == False :
+        #
+        # At this point we have either destroyed the table or it does NOT exist yet
+        #
+
+        sql = "SELECT person_id, DATE_DIFF(CURRENT_DATE,CAST(value_as_string as DATE) , DAY)+ CAST (700*rand() AS INT64) as seed FROM :i_dataset.observation WHERE observation_source_value = 'ExtraConsent_TodaysDate' GROUP BY person_id,value_as_string ORDER BY 1".replace(":i_dataset",dataset)
+        job = bq.QueryJobConfig()
+        job.destination = client.dataset(dataset).table("people_seed")
+        job.use_query_cache = True
+        job.allow_large_results = True
+        # job.dry_run = True    
+        r = client.query(sql,location='US',job_config=job)        
+        Logging.log(subject='composer',object='big.query',action='create.table',value=r.job_id)
 
 #
 # The code below will implement the orchestration and parameter handling from the command line 
@@ -715,6 +754,9 @@ if __name__ == '__main__' :
     table       = SYS_ARGS['table']    
     o_dataset   = SYS_ARGS['o_dataset']
     remove      = SYS_ARGS['config']['suppression'][table] if table in SYS_ARGS['config']['suppression'] else []
+    
+    initialization(client,i_dataset)
+
     #
     # The operation will be performed via the implementation of a form of iterator-design pattern
     # design information here https://en.wikipedia.org/wiki/Iterator_pattern
@@ -736,7 +778,8 @@ if __name__ == '__main__' :
         # @Log: We are logging here the operaton that is expected to take place
         # {"action":"building-sql","input":fields,"subject":table,"object":""}        
         
-        p       =  item.can_do(i_dataset,table)               
+        p       =  item.can_do(i_dataset,table)   
+        Logging.log(subject="composer",object=name,action="can.do",value= (i_dataset+"."+table) )             
         if p :
             r[name] = item.get(i_dataset,table)
         else:
@@ -751,8 +794,10 @@ if __name__ == '__main__' :
     #
     # Let's get basic project of fields and provide a prefix to the query
     #
-    fields =  r['dropfields']['fields']
-    sql = "SELECT :parent_fields FROM ("+r['dropfields']['sql']+") a"
+    fields  =  r['dropfields']['fields']
+    # sql     = "SELECT :parent_fields FROM ("+r['dropfields']['sql']+") a"
+    sql = r['dropfields']['sql']
+    
     #
     # @Log: We are logging here the operaton that is expected to take place
     # {"action":"building-sql","input":fields,"subject":table,"object":""}
@@ -773,6 +818,7 @@ if __name__ == '__main__' :
             join_fields = ",".join(['']+r['shift']['join']['fields']) #-- should start with comma
             # sql = sql + " INNER JOIN (:sql) p ON p.person_id = a.person_id ".replace(":sql",join_sql)
             shifted_values = ","+ ",".join(r['shift']['join']['shifted_values'])
+            
         else:
             prefixed_fields = ['a.'+name for name in fields if name not in fields ]
             join_fields = ""
@@ -847,6 +893,7 @@ if __name__ == '__main__' :
     FILTER = " ".join(FILTER)
     
     sql = "SELECT * :dropped_fields FROM ("+sql+") "+FILTER
+    
     #
     # Bug-fix:
     #   Insuring the tables maintain their structural integrity
@@ -858,7 +905,7 @@ if __name__ == '__main__' :
     # print sql
     Logging.log(subject='composer',object=table,action='formatted.removed.columns',value=remove['columns'])
     sql = sql.replace(":dropped_fields",dropped_fields)
-      
+    # print sql  
     #
     # @Log: We are logging here the operaton that is expected to take place
     # {"action":"submit-sql","input":fields,"subject":table,"object":"bq"}      
@@ -870,6 +917,7 @@ if __name__ == '__main__' :
     job.destination = client.dataset(o_dataset).table(table)
     job.use_query_cache = True
     job.allow_large_results = True
+    job.priority = 'BATCH'
     # job.dry_run = True    
     r = client.query(sql,location='US',job_config=job)
 
